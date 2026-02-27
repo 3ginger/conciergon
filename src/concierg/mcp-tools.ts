@@ -16,15 +16,7 @@ export interface RegisteredIntent {
   workerId: number | null;
   questionId: number | null;
   emoji: string | null;
-}
-
-export interface WorkerDetails {
-  state: string;
-  stdout: string;
-  stderr: string;
-  events: Array<{ timestamp: Date; type: string; content: string }>;
-  totalCostUsd: number;
-  hasManagerLLM: boolean;
+  planMode: boolean;
 }
 
 interface McpContext {
@@ -32,17 +24,9 @@ interface McpContext {
   intents: RegisteredIntent[];
   sendMessage: (chatId: number, text: string) => Promise<void>;
   sendPhoto: (chatId: number, photoPath: string, caption?: string) => Promise<void>;
-  getWorkerDetails: (workerId: number) => WorkerDetails | null;
 }
 
 let currentCtx: McpContext | null = null;
-
-// Global worker details provider — set once at startup from Manager
-let workerDetailsProvider: ((workerId: number) => WorkerDetails | null) | null = null;
-
-export function setWorkerDetailsProvider(provider: (workerId: number) => WorkerDetails | null): void {
-  workerDetailsProvider = provider;
-}
 
 export function setMcpContext(ctx: McpContext): void {
   currentCtx = ctx;
@@ -52,8 +36,18 @@ export function clearMcpContext(): void {
   currentCtx = null;
 }
 
-export function getWorkerDetailsFromProvider(workerId: number): WorkerDetails | null {
-  return workerDetailsProvider?.(workerId) ?? null;
+// --- Pool info getter (set once at startup from index.ts) ---
+
+export interface WorkerPoolInfo {
+  poolStatus: 'warm' | 'cold' | 'not_in_pool';
+  phase: 'planning' | 'executing';
+  hasPendingPlan: boolean;
+}
+
+let poolInfoGetter: ((workerId: number) => WorkerPoolInfo | null) | null = null;
+
+export function setPoolInfoGetter(getter: (workerId: number) => WorkerPoolInfo | null): void {
+  poolInfoGetter = getter;
 }
 
 export function getRegisteredIntents(): RegisteredIntent[] {
@@ -122,6 +116,7 @@ const registerIntentTool = tool(
     workerId: z.number().optional().describe("Worker ID (required for follow_up, stop, pause, resume, restore_worker)"),
     questionId: z.number().optional().describe("Question ID (required for answer_question)"),
     emoji: z.string().optional().describe("A single emoji representing the task theme (required for spawn_worker). Be creative and varied."),
+    planMode: z.boolean().optional().describe("If true (default), worker starts in plan mode — reviews plan before executing. Set false if user says to skip planning or just do it."),
   },
   async (args) => {
     if (!currentCtx) {
@@ -172,6 +167,7 @@ const registerIntentTool = tool(
       workerId: args.workerId ?? null,
       questionId: args.questionId ?? null,
       emoji: args.emoji ?? null,
+      planMode: args.planMode ?? true,
     };
 
     currentCtx.intents.push(intent);
@@ -193,20 +189,24 @@ const getSystemStateTool = tool(
       const activeWorkers = context.activeWorkers
         .map((w) => {
           let info = `  Worker #${w.id}: project_id=${w.projectId}, state=${w.state}, prompt="${w.currentPrompt}"`;
+
+          // Pool info from dispatcher
+          const pInfo = poolInfoGetter?.(w.id);
+          if (pInfo) {
+            info += `, pool_status=${pInfo.poolStatus}, phase=${pInfo.phase}, has_pending_plan=${pInfo.hasPendingPlan}`;
+          } else {
+            info += `, pool_status=not_in_pool`;
+          }
+
           if (w.lastActivityAt) {
             const minutes = Math.floor(
               (Date.now() - new Date(w.lastActivityAt + "Z").getTime()) / 60000
             );
-            info += `, last_activity=${minutes}min ago`;
-          }
-          // Add current activity one-liner from worker events
-          if (currentCtx) {
-            const details = currentCtx.getWorkerDetails(w.id);
-            if (details && details.events.length > 0) {
-              const lastAction = [...details.events].reverse().find(e => e.type !== 'state');
-              if (lastAction) {
-                info += `, doing="${lastAction.content.slice(0, 80)}"`;
-              }
+            const poolStatus = pInfo?.poolStatus;
+            if (poolStatus === 'cold') {
+              info += `, idle_for=${minutes}min (worker is cold - waiting for interaction, NOT stuck)`;
+            } else {
+              info += `, idle_for=${minutes}min`;
             }
           }
           return info;
@@ -233,50 +233,9 @@ const getSystemStateTool = tool(
   }
 );
 
-const getWorkerDetailsTool = tool(
-  "get_worker_details",
-  "Get detailed information about a specific worker: state, recent events (manager-worker interactions), cumulative cost, and time since last activity. Use this when the user asks about a specific worker's progress.",
-  {
-    workerId: z.number().describe("The worker ID to get details for"),
-  },
-  async (args) => {
-    if (!currentCtx) {
-      return { content: [{ type: "text" as const, text: "Error: no active context" }] };
-    }
-
-    const details = currentCtx.getWorkerDetails(args.workerId);
-    if (!details) {
-      return { content: [{ type: "text" as const, text: `Worker #${args.workerId} not found` }] };
-    }
-
-    const events = details.events
-      .slice(-20)
-      .map((e) => {
-        const time = e.timestamp instanceof Date
-          ? e.timestamp.toISOString().slice(11, 19)
-          : String(e.timestamp);
-        return `  [${time}] ${e.type}: ${e.content}`;
-      })
-      .join("\n");
-
-    const text = [
-      `Worker #${args.workerId}:`,
-      `  State: ${details.state}`,
-      `  Total cost: $${details.totalCostUsd.toFixed(4)}`,
-      `  Manager LLM: ${details.hasManagerLLM ? "active" : "none"}`,
-      `  Last stdout: ${details.stdout ? details.stdout.slice(0, 300) : "(none)"}`,
-      details.stderr ? `  Last stderr: ${details.stderr.slice(0, 300)}` : null,
-      `\nRecent events (last 20):`,
-      events || "  (none)",
-    ].filter(Boolean).join("\n");
-
-    return { content: [{ type: "text" as const, text }] };
-  }
-);
-
 // --- MCP server ---
 
 export const conciergMcpServer = createSdkMcpServer({
   name: "concierg",
-  tools: [sendTelegramMessageTool, sendTelegramPhotoTool, registerIntentTool, getSystemStateTool, getWorkerDetailsTool],
+  tools: [sendTelegramMessageTool, sendTelegramPhotoTool, registerIntentTool, getSystemStateTool],
 });

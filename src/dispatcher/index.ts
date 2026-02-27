@@ -5,29 +5,24 @@ import { type SDKResultMessage } from "@anthropic-ai/claude-code";
 
 import { notifyConcierg } from "../concierg/index.js";
 import {
-  answerQuestion,
   getActiveWorkers,
   getAllProjects,
   getProjectByName,
-  getQuestionById,
   getResumableWorkers,
-  getUnansweredQuestions,
   getWorkerById,
   getWorkerWithProject,
   hasCompletionEvent,
   insertEvent,
-  insertPendingQuestion,
   insertWorker,
   markIntentProcessed,
   markWorkerStopped,
   updateWorkerState,
 } from "../db/queries.js";
 import { getConfig } from "../config/index.js";
-import { ManagerLLM } from "../manager-llm/index.js";
 import { WorkerState } from "../types/index.js";
-import type { AskUserQuestionItem } from "../types/index.js";
 import { createChildLogger } from "../utils/logger.js";
 import { WorkerLLM, WorkerPool } from "../worker/index.js";
+import type { WorkerTelegramContext } from "../worker/session.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const GENERAL_WORKER_DIR = join(__dirname, "..", "..", "concierg-workspace", "general-worker");
@@ -38,25 +33,47 @@ function sanitizeResult(text: string): string {
   return text.replace(/\/Users\/[^\s"'<>)}\]]+/g, "[path hidden]");
 }
 
-// In-memory map of pending question resolvers (fallback for non-ManagerLLM workers)
-const questionResolvers = new Map<number, (answer: string) => void>();
+/** Telegram functions injected at startup */
+export interface TelegramFunctions {
+  sendMessage: (chatId: number, text: string) => Promise<number>;
+  sendLongMessage: (chatId: number, text: string) => Promise<number[]>;
+  sendQuestionMessage: (
+    chatId: number,
+    workerId: number,
+    questionId: number,
+    question: string,
+    options?: Array<{ label: string; description?: string }>,
+    multiSelect?: boolean,
+    emoji?: string,
+  ) => Promise<number>;
+  sendPhoto: (chatId: number, photoPath: string, caption?: string) => Promise<number>;
+}
+
+/**
+ * In-memory map: telegramMsgId → workerId for reply routing.
+ * When a worker sends a message to Telegram, we track it here so that
+ * when the user replies to that message, we know which worker to route to.
+ */
+const messageToWorker = new Map<number, number>();
+
+export function getWorkerIdByTelegramMessage(telegramMsgId: number): number | undefined {
+  return messageToWorker.get(telegramMsgId);
+}
 
 export class Dispatcher {
   private pool: WorkerPool;
-  private managerLLMs = new Map<number, ManagerLLM>();
-  private mllmInitiatedFollowUps = new Set<number>();
-  private completionRounds = new Map<number, number>();
+  private telegramFns: TelegramFunctions | null = null;
 
   constructor() {
     this.pool = new WorkerPool();
   }
 
-  getPool(): WorkerPool {
-    return this.pool;
+  setTelegramFunctions(fns: TelegramFunctions): void {
+    this.telegramFns = fns;
   }
 
-  hasManagerLLM(workerId: number): boolean {
-    return this.managerLLMs.has(workerId);
+  getPool(): WorkerPool {
+    return this.pool;
   }
 
   getWorkerOutput(workerId: number): {
@@ -94,6 +111,7 @@ export class Dispatcher {
     prompt: string;
     userSummary?: string;
     emoji?: string | null;
+    planMode?: boolean;
     workerId: number | null;
     questionId: number | null;
     telegramChatId: number;
@@ -112,6 +130,7 @@ export class Dispatcher {
             intent.telegramChatId,
             intent.userSummary,
             intent.emoji,
+            intent.planMode ?? true,
           );
           break;
 
@@ -139,8 +158,12 @@ export class Dispatcher {
           await this.resume(intent.workerId, intent.telegramChatId);
           break;
 
+        case "rewind":
+          await this.rewindWorker(intent.workerId, intent.prompt);
+          break;
+
         case "status":
-          // Concierg handles status via get_system_state + send_telegram_message (Concierg's own tool)
+          // Concierg handles status via get_system_state + send_telegram_message
           break;
 
         case "general":
@@ -155,129 +178,21 @@ export class Dispatcher {
     }
   }
 
-  // --- ManagerLLM creation helper ---
+  // --- Telegram context factory ---
 
-  private createManagerLLM(
-    workerId: number,
-    projectName: string,
-    taskPrompt: string,
-    userMessage: string,
-    userSummary: string,
-    chatId: number,
-    workerEmoji?: string,
-  ): ManagerLLM {
-    return new ManagerLLM({
-      workerId,
-      workerEmoji: workerEmoji || "🔵",
-      getWorkerPhase: () => {
-        const session = this.pool.get(workerId);
-        return session?.phase ?? 'planning';
+  private makeTelegramContext(chatId: number, emoji: string): WorkerTelegramContext {
+    if (!this.telegramFns) throw new Error("Telegram functions not set");
+    return {
+      chatId,
+      emoji,
+      sendMessage: this.telegramFns.sendMessage,
+      sendLongMessage: this.telegramFns.sendLongMessage,
+      sendQuestionMessage: this.telegramFns.sendQuestionMessage,
+      sendPhoto: this.telegramFns.sendPhoto,
+      trackMessage: (telegramMsgId, workerId) => {
+        messageToWorker.set(telegramMsgId, workerId);
       },
-      projectName,
-      taskPrompt,
-      userMessage,
-      userSummary,
-      notifyConcierg,
-      insertQuestion: (wId: number, question: string) => {
-        const row = insertPendingQuestion(wId, question, "");
-        return row.id;
-      },
-      getWorkerFollowUp: () => async (message: string) => {
-        const session = this.pool.get(workerId);
-        if (!session) throw new Error(`Worker #${workerId} not found`);
-        this.mllmInitiatedFollowUps.add(workerId);
-        await session.followUp(message);
-      },
-      getWorkerStatus: () => {
-        const output = this.getWorkerOutput(workerId);
-        if (!output) return null;
-        return {
-          state: output.state,
-          recentEvents: output.events,
-        };
-      },
-    });
-  }
-
-  // --- Wire worker callbacks through ManagerLLM ---
-
-  private wireWorkerCallbacks(
-    session: WorkerLLM,
-    mllm: ManagerLLM | null,
-    chatId: number,
-  ): void {
-    const workerId = session.id;
-
-    if (mllm) {
-      // Route through ManagerLLM
-      session.onQuestion = async (_wId, question, _toolUseId, structuredQuestions) => {
-        return new Promise<string>((resolve) => {
-          mllm.setQuestionResolver(resolve);
-
-          // Include structured options so ManagerLLM can pass them to ask_user_question
-          let eventText = `Worker asked: ${question}`;
-          if (structuredQuestions && structuredQuestions.length > 0) {
-            const hasOptions = structuredQuestions.some(q => q.options.length > 0);
-            if (hasOptions) {
-              eventText += `\n\nStructured options (pass these to ask_user_question's options parameter):\n`;
-              eventText += JSON.stringify(
-                structuredQuestions.flatMap(q => q.options.map(o => ({
-                  label: o.label,
-                  ...(o.description ? { description: o.description } : {}),
-                }))),
-                null,
-                2
-              );
-            }
-          }
-
-          mllm.injectEvent(eventText);
-        });
-      };
-
-      // Plan review via ExitPlanMode interception (exp #1 + #3 learning)
-      session.onPlanReview = async (_wId, plan) => {
-        return new Promise<string>((resolve) => {
-          mllm.setPlanResolver(resolve);
-          mllm.injectEvent(
-            `Worker #${workerId} submitted a plan for review:\n${plan}\n\n` +
-            `IMPORTANT: Send a concise summary of this plan to the user via report_progress. ` +
-            `Add your assessment. Wait for the user to confirm. ` +
-            `Then use answer_worker_plan with APPROVED: or REJECTED: prefix.`
-          );
-        });
-      };
-
-      session.onNotification = (_wId, message, title) => {
-        const event = title
-          ? `Worker notification (${title}): ${message}`
-          : `Worker notification: ${message}`;
-        mllm.injectEvent(event);
-      };
-
-      session.onCompletion = (_wId, result) => {
-        this.handleCompletionWithMLLM(workerId, result, mllm, chatId);
-      };
-    } else {
-      // Fallback: direct communication through Concierg (no ManagerLLM)
-      session.onQuestion = async (_wId, question, _toolUseId, structuredQuestions) => {
-        return this.handleWorkerQuestionDirect(workerId, question, structuredQuestions);
-      };
-
-      // Fallback: auto-approve plan
-      session.onPlanReview = async (_wId, _plan) => {
-        return "APPROVED: Auto-approved (no ManagerLLM)";
-      };
-
-      session.onNotification = (_wId, message, title) => {
-        const prefix = title ? `${title}: ` : "";
-        notifyConcierg(`[NOTIFICATION | Worker #${workerId}] ${prefix}${message}`);
-      };
-
-      session.onCompletion = (_wId, result) => {
-        this.handleWorkerCompletionDirect(workerId, result);
-      };
-    }
+    };
   }
 
   // --- Spawn ---
@@ -288,6 +203,7 @@ export class Dispatcher {
     chatId: number,
     userSummary?: string,
     emoji?: string | null,
+    planMode: boolean = true,
   ): Promise<void> {
     if (!projectName) {
       notifyConcierg("[ERROR] No project specified for spawn");
@@ -322,174 +238,43 @@ export class Dispatcher {
     }
 
     const workerRow = insertWorker(projectId, prompt, chatId, emoji);
-
-    // ManagerLLM bootstrap tells the user the task started via report_progress.
-    // No direct notifyConcierg here — that would create a duplicate.
+    const workerEmoji = emoji || "🔵";
 
     // Enrich prompt with evidence instructions
     const enrichedPrompt = prompt + '\n\n' +
       'When you complete your task, include evidence of success: test results, ' +
       'file contents, or command output that proves the work is done correctly. ' +
-      'If you are unsure about anything, use AskUserQuestion to ask.';
+      'If you are unsure about anything, use AskUserQuestion to ask. ' +
+      'Use the send_telegram_message tool to send progress updates to the user.';
 
-    const session = new WorkerLLM(workerRow.id, projectPath, enrichedPrompt);
+    const telegramCtx = this.makeTelegramContext(chatId, workerEmoji);
+    const session = new WorkerLLM(
+      workerRow.id,
+      projectPath,
+      enrichedPrompt,
+      telegramCtx,
+      planMode ? 'plan' : 'default',
+    );
 
-    let mllm: ManagerLLM | null = null;
-    try {
-      mllm = this.createManagerLLM(
-        workerRow.id,
-        resolvedProjectName,
-        prompt,
-        userSummary || prompt,
-        userSummary || prompt,
-        chatId,
-        emoji || undefined,
-      );
-      this.pool.add(session); // Add to pool before starting MLLM (getWorkerFollowUp needs it)
-      await mllm.start();
-      this.managerLLMs.set(workerRow.id, mllm);
-      log.info({ workerId: workerRow.id }, "ManagerLLM started");
-    } catch (err) {
-      log.error({ err, workerId: workerRow.id }, "ManagerLLM failed to start, using fallback");
-      mllm = null;
-      notifyConcierg(`[SPAWN | Worker #${workerRow.id} | project: ${resolvedProjectName}] Task: "${userSummary || prompt}" (ManagerLLM unavailable)`);
-      if (!this.pool.get(workerRow.id)) {
-        this.pool.add(session);
-      }
-    }
+    // Wire completion callback
+    session.onCompletion = (_wId, _result) => {
+      // Completion is handled inside WorkerLLM.handleCompletion() which sends to Telegram directly
+      // This callback is for additional cleanup if needed
+    };
 
-    // Wire callbacks
-    this.wireWorkerCallbacks(session, mllm, chatId);
+    this.pool.add(session);
+
+    // Notify user via Concierg
+    notifyConcierg(
+      `[SPAWN | Worker #${workerRow.id} | ${workerEmoji} | project: ${resolvedProjectName} | mode: ${planMode ? 'plan' : 'default'}] Task: "${userSummary || prompt}"`
+    );
 
     // Start worker in background
     session.start().catch((err) => {
       log.error({ err, workerId: workerRow.id }, "Worker start failed");
       updateWorkerState(workerRow.id, WorkerState.Errored);
-      if (mllm) {
-        mllm.injectEvent(`Worker #${workerRow.id} failed to start: ${(err as Error).message}`);
-      } else {
-        notifyConcierg(`[ERROR | Worker #${workerRow.id}] Failed to start: ${(err as Error).message}`);
-      }
+      notifyConcierg(`[ERROR | Worker #${workerRow.id}] Failed to start: ${(err as Error).message}`);
       this.removeWorkerFromPool(workerRow.id);
-    });
-  }
-
-  // --- Completion handling ---
-
-  private handleCompletionWithMLLM(
-    workerId: number,
-    result: SDKResultMessage,
-    mllm: ManagerLLM,
-    chatId: number,
-  ): void {
-    const resultText = result.subtype === "success"
-      ? result.result || "(no output)"
-      : `(error: ${result.subtype})`;
-    const cost = result.total_cost_usd.toFixed(4);
-
-    // Get cumulative cost from worker session
-    const session = this.pool.get(workerId);
-    const totalCost = session ? session.totalCostUsd.toFixed(4) : cost;
-
-    // Track completion rounds and whether this was an MLLM-initiated follow-up
-    const round = (this.completionRounds.get(workerId) ?? 0) + 1;
-    this.completionRounds.set(workerId, round);
-    const wasMLLMFollowUp = this.mllmInitiatedFollowUps.delete(workerId);
-
-    let eventText: string;
-
-    if (round > 3) {
-      // Hard safety cap
-      eventText =
-        `Worker #${workerId} completed round ${round}. Result: ${resultText}\n` +
-        `Cost: $${cost} | Total: $${totalCost}\n` +
-        `Maximum rounds reached. Send the final result to the user now. Do NOT send further follow-ups.`;
-    } else if (wasMLLMFollowUp) {
-      // Response to MLLM's own challenge — just report, don't re-challenge
-      eventText =
-        `Worker #${workerId} responded to your verification request (${result.subtype}).\n` +
-        `Result: ${resultText}\n` +
-        `Cost: $${cost} | Total: $${totalCost}\n` +
-        `Review the evidence. If sufficient, notify the user with the final result. ` +
-        `Only send another follow-up if something is clearly wrong or missing.`;
-    } else {
-      // First completion or user-initiated follow-up — evaluate
-      eventText =
-        `Worker #${workerId} reports completion (${result.subtype}).\n` +
-        `Result: ${resultText}\n` +
-        `This round cost: $${cost} | Total cost: $${totalCost}\n\n` +
-        `Review this result against the original task. ` +
-        `If the worker included test results, file contents, or other evidence of success — accept it and notify the user. ` +
-        `Only challenge for proof if the result is clearly incomplete, vague, or unverified.`;
-    }
-
-    mllm.injectEvent(eventText).catch((err) => {
-      log.error({ err, workerId }, "ManagerLLM completion event failed, using fallback");
-      this.handleWorkerCompletionDirect(workerId, result);
-    });
-
-    // DB event only — ManagerLLM handles user notification via notifyConcierg
-    insertEvent(workerId, "result", {
-      subtype: result.subtype,
-      cost: result.total_cost_usd,
-      turns: result.num_turns,
-    });
-  }
-
-  // --- Direct communication (fallback, no ManagerLLM) ---
-
-  private async handleWorkerQuestionDirect(
-    workerId: number,
-    question: string,
-    structuredQuestions?: AskUserQuestionItem[]
-  ): Promise<string> {
-    const questionRow = insertPendingQuestion(workerId, question, "");
-
-    let eventText = `[QUESTION #${questionRow.id} | Worker #${workerId}]\n${question}`;
-    if (structuredQuestions?.length) {
-      const withOptions = structuredQuestions.find(q => q.options.length > 0);
-      if (withOptions) {
-        eventText += '\nOptions:\n' + withOptions.options
-          .map((o, i) => `  ${i + 1}. ${o.label}${o.description ? ' — ' + o.description : ''}`)
-          .join('\n');
-      }
-    }
-    notifyConcierg(eventText);
-
-    return new Promise<string>((resolve) => {
-      questionResolvers.set(questionRow.id, resolve);
-    });
-  }
-
-  resolveQuestion(questionId: number, answer: string): void {
-    const resolver = questionResolvers.get(questionId);
-    if (resolver) {
-      answerQuestion(questionId, answer);
-      resolver(answer);
-      questionResolvers.delete(questionId);
-      log.info({ questionId, answer }, "Question resolved (direct)");
-    } else {
-      log.warn({ questionId }, "No resolver found for question");
-    }
-  }
-
-  private handleWorkerCompletionDirect(
-    workerId: number,
-    result: SDKResultMessage,
-  ): void {
-    const cost = result.total_cost_usd.toFixed(4);
-    const resultSnippet = result.subtype === "success"
-      ? sanitizeResult(result.result?.slice(0, 500) || "(no output)")
-      : "(error)";
-
-    notifyConcierg(
-      `[RESULT | Worker #${workerId} | ${result.subtype}] ${resultSnippet} | Cost: $${cost}`
-    );
-
-    insertEvent(workerId, "result", {
-      subtype: result.subtype,
-      cost: result.total_cost_usd,
-      turns: result.num_turns,
     });
   }
 
@@ -500,37 +285,52 @@ export class Dispatcher {
     answer: string,
   ): Promise<void> {
     if (questionId) {
-      // Try to route through ManagerLLM
-      const question = getQuestionById(questionId);
-      if (question) {
-        const mllm = this.managerLLMs.get(question.workerId);
-        if (mllm) {
-          answerQuestion(questionId, answer);
-          mllm.injectEvent(`User answered question #${questionId}: ${answer}`);
+      // Find the worker that owns this question and resolve it
+      for (const session of this.pool.getAll()) {
+        if (session.hasQuestion(questionId)) {
+          session.resolveQuestion(questionId, answer);
           return;
         }
       }
-
-      // Fallback: direct resolve
-      this.resolveQuestion(questionId, answer);
+      log.warn({ questionId }, "No worker found with this question");
+      notifyConcierg("[ERROR] No worker found with this pending question.");
       return;
     }
 
-    // Try to find a single unanswered question
-    const pending = getUnansweredQuestions();
-    if (pending.length === 1) {
-      const mllm = this.managerLLMs.get(pending[0].workerId);
-      if (mllm) {
-        answerQuestion(pending[0].id, answer);
-        mllm.injectEvent(`User answered question #${pending[0].id}: ${answer}`);
-        return;
-      }
-      this.resolveQuestion(pending[0].id, answer);
-    } else if (pending.length > 1) {
-      notifyConcierg("[ERROR] Multiple pending questions. Reply to the specific question.");
+    // Try to find a single worker with pending questions
+    const workersWithQuestions = this.pool.getAll().filter(
+      (w) => w.state === WorkerState.WaitingInput
+    );
+
+    if (workersWithQuestions.length === 1) {
+      // Auto-route to the only waiting worker — but we don't know the questionId
+      notifyConcierg("[ERROR] Please reply to the specific question message or tap a button.");
+    } else if (workersWithQuestions.length > 1) {
+      notifyConcierg("[ERROR] Multiple workers waiting. Reply to the specific question.");
     } else {
       notifyConcierg("[ERROR] No pending questions to answer.");
     }
+  }
+
+  /** Resolve a question by ID — called from callback handler */
+  resolveQuestion(questionId: number, answer: string): boolean {
+    for (const session of this.pool.getAll()) {
+      if (session.resolveQuestion(questionId, answer)) {
+        return true;
+      }
+    }
+    log.warn({ questionId }, "No resolver found for question");
+    return false;
+  }
+
+  /** Resolve a plan review for a worker — called from callback handler */
+  resolvePlan(workerId: number, decision: string): boolean {
+    const session = this.pool.get(workerId);
+    if (session) {
+      return session.resolvePlan(decision);
+    }
+    log.warn({ workerId }, "No worker found for plan resolution");
+    return false;
   }
 
   // --- Follow-up ---
@@ -565,22 +365,15 @@ export class Dispatcher {
         notifyConcierg(`[SYSTEM | Worker #${targetId}] Resuming cold worker...`);
         session.warmUp(worker.sessionId).catch((err) => {
           log.error({ err, workerId: targetId }, "Cold worker warm-up failed");
-          updateWorkerState(targetId, WorkerState.Errored);
+          updateWorkerState(targetId!, WorkerState.Errored);
           notifyConcierg(`[ERROR | Worker #${targetId}] Resume failed: ${(err as Error).message}`);
-          this.removeWorkerFromPool(targetId);
+          this.removeWorkerFromPool(targetId!);
         });
         return;
       }
     }
 
-    // Try to route through ManagerLLM
-    const mllm = this.managerLLMs.get(targetId);
-    if (mllm) {
-      mllm.injectEvent(`User says: ${message}`);
-      return;
-    }
-
-    // Fallback: direct follow-up
+    // Direct follow-up to worker
     try {
       await session.followUp(message);
     } catch (err) {
@@ -589,7 +382,7 @@ export class Dispatcher {
     }
   }
 
-  // --- Stop / Pause / Resume / Restore ---
+  // --- Stop / Pause / Resume ---
 
   private async stopWorker(
     workerId: number | null,
@@ -641,9 +434,53 @@ export class Dispatcher {
   }
 
   /**
-   * Unified resume: handles both "resume" and "restore" intents.
-   * Returns a result that Concierg LLM can act on (e.g. suggest spawning new worker).
+   * Rewind a worker: switch back to planning mode and send a follow-up.
+   * The mode change takes effect on the next query (after interrupt + follow-up).
    */
+  private async rewindWorker(
+    workerId: number | null,
+    reason: string,
+  ): Promise<void> {
+    if (!workerId) {
+      const active = getActiveWorkers();
+      if (active.length === 1) {
+        workerId = active[0].id;
+      } else {
+        notifyConcierg("[ERROR] Specify which worker to rewind.");
+        return;
+      }
+    }
+
+    const session = this.pool.get(workerId);
+    if (!session) {
+      notifyConcierg(`[ERROR | Worker #${workerId}] Worker not found.`);
+      return;
+    }
+
+    const wasPlanning = session.permissionMode === 'plan';
+
+    if (wasPlanning && !session.phase) {
+      notifyConcierg(`[ERROR | Worker #${workerId}] Worker is already in planning mode.`);
+      return;
+    }
+
+    // Switch mode — takes effect on next query
+    session.switchToPlanning();
+
+    // Send follow-up to interrupt current work and re-enter planning
+    const followUpMessage = reason
+      ? `STOP current work. User wants to go back to planning mode. Reason: ${reason}\n\nRe-evaluate your approach. Create a new plan based on the user's feedback. Use ExitPlanMode when your plan is ready.`
+      : `STOP current work. User wants to go back to planning mode.\n\nRe-evaluate your approach and create a new plan. Use ExitPlanMode when your plan is ready.`;
+
+    try {
+      await session.followUp(followUpMessage);
+      notifyConcierg(`[REWIND | Worker #${workerId}] Switched back to planning mode.`);
+    } catch (err) {
+      log.error({ err, workerId }, "Failed to rewind worker");
+      notifyConcierg(`[ERROR | Worker #${workerId}] Failed to rewind: ${(err as Error).message}`);
+    }
+  }
+
   async resume(
     workerId: number | null,
     chatId: number
@@ -690,14 +527,10 @@ export class Dispatcher {
       return { success: false, reason: "no_session" };
     }
 
-    const session = new WorkerLLM(worker.id, project.path, worker.currentPrompt);
-    await this.addSessionWithMLLM(session, {
-      managerSessionId: worker.managerSessionId,
-      projectName: project.name,
-      currentPrompt: worker.currentPrompt,
-      chatId,
-      emoji: worker.emoji || undefined,
-    });
+    const telegramCtx = this.makeTelegramContext(chatId, worker.emoji || "🔵");
+    const session = new WorkerLLM(worker.id, project.path, worker.currentPrompt, telegramCtx);
+
+    this.pool.add(session);
 
     notifyConcierg(
       `[RESUMING | Worker #${workerId} | project: ${project.name}] Task: "${worker.currentPrompt}"`
@@ -720,62 +553,14 @@ export class Dispatcher {
     insertEvent(workerId, "idle_alert", {});
   }
 
-  // --- Session bootstrap (shared by resume / restore / DB recovery) ---
-
-  /**
-   * Add a worker session to the pool, optionally resuming its ManagerLLM.
-   * Returns the ManagerLLM instance (or null if unavailable/failed).
-   */
-  private async addSessionWithMLLM(
-    session: WorkerLLM,
-    opts: {
-      managerSessionId?: string | null;
-      projectName: string;
-      currentPrompt: string;
-      chatId: number;
-      emoji?: string;
-    },
-  ): Promise<ManagerLLM | null> {
-    let mllm: ManagerLLM | null = null;
-
-    if (opts.managerSessionId) {
-      try {
-        mllm = this.createManagerLLM(
-          session.id, opts.projectName, opts.currentPrompt, "", "", opts.chatId, opts.emoji,
-        );
-        this.pool.add(session);
-        await mllm.start(opts.managerSessionId);
-        this.managerLLMs.set(session.id, mllm);
-      } catch (err) {
-        log.error({ err, workerId: session.id }, "Failed to resume ManagerLLM");
-        mllm = null;
-        if (!this.pool.get(session.id)) this.pool.add(session);
-      }
-    } else {
-      this.pool.add(session);
-    }
-
-    this.wireWorkerCallbacks(session, mllm, opts.chatId);
-    return mllm;
-  }
-
   // --- Cleanup ---
 
-  /** Remove worker from in-memory pool and stop ManagerLLM. Does NOT touch DB state. */
   private removeWorkerFromPool(workerId: number): void {
     const session = this.pool.get(workerId);
     if (session) session.abort();
     this.pool.remove(workerId);
-    const mllm = this.managerLLMs.get(workerId);
-    if (mllm) {
-      mllm.stop();
-      this.managerLLMs.delete(workerId);
-    }
-    this.completionRounds.delete(workerId);
-    this.mllmInitiatedFollowUps.delete(workerId);
   }
 
-  /** Intentional stop: remove from pool + mark as stopped in DB. */
   cleanupWorker(workerId: number): void {
     this.removeWorkerFromPool(workerId);
     markWorkerStopped(workerId);
@@ -787,21 +572,11 @@ export class Dispatcher {
       markWorkerStopped(session.id);
       insertEvent(session.id, "removed", { reason: "shutdown" });
     }
-    for (const [, mllm] of this.managerLLMs) {
-      mllm.stop();
-    }
-    this.managerLLMs.clear();
-    this.completionRounds.clear();
-    this.mllmInitiatedFollowUps.clear();
     await this.pool.stopAll();
   }
 
   // --- Cold Resume from DB ---
 
-  /**
-   * Cold-register recent workers into pool on startup.
-   * No SDK sessions are started — workers sit dormant until user sends a follow-up or "resume".
-   */
   async coldResumeWorkersFromDb(): Promise<void> {
     const MAX_COLD_REGISTRATIONS = 10;
     const { WORKER_RESUME_MAX_AGE_S } = getConfig();
@@ -860,14 +635,9 @@ export class Dispatcher {
         "Cold-registering worker from DB"
       );
 
-      const session = new WorkerLLM(worker.id, workerData.project.path, worker.currentPrompt);
-      await this.addSessionWithMLLM(session, {
-        managerSessionId: worker.managerSessionId,
-        projectName: workerData.project.name,
-        currentPrompt: worker.currentPrompt,
-        chatId: worker.telegramChatId,
-        emoji: worker.emoji || undefined,
-      });
+      const telegramCtx = this.makeTelegramContext(worker.telegramChatId, worker.emoji || "🔵");
+      const session = new WorkerLLM(worker.id, workerData.project.path, worker.currentPrompt, telegramCtx);
+      this.pool.add(session);
       // Note: session.start() is NOT called — worker is cold
     }
 

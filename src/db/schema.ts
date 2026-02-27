@@ -33,7 +33,6 @@ export const workers = sqliteTable("workers", {
     .notNull()
     .references(() => projects.id),
   sessionId: text("session_id"),
-  managerSessionId: text("manager_session_id"),
   state: text("state").notNull().default("starting"), // WorkerState enum: starting | active | waiting_input | errored (+ "stopped" DB-only)
   currentPrompt: text("current_prompt").notNull(),
   emoji: text("emoji"),

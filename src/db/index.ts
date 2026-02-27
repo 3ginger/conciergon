@@ -97,12 +97,6 @@ function createTables(sqlite: Database.Database) {
   }
 
   try {
-    sqlite.prepare("ALTER TABLE workers ADD COLUMN manager_session_id TEXT").run();
-  } catch {
-    // Column already exists — ignore
-  }
-
-  try {
     sqlite.prepare("ALTER TABLE workers ADD COLUMN emoji TEXT").run();
   } catch {
     // Column already exists — ignore

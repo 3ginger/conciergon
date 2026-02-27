@@ -37,6 +37,7 @@ export interface ClassifiedIntent {
   workerId: number | null;
   questionId: number | null;
   emoji: string | null;
+  planMode: boolean;
   telegramMessageId: number;
   telegramChatId: number;
   replyToMessageId: number | null;

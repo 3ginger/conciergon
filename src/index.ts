@@ -8,20 +8,25 @@ import {
   stopConciergSession,
   pingConciergSession,
 } from "./concierg/index.js";
-import { setWorkerDetailsProvider } from "./concierg/mcp-tools.js";
-import { Dispatcher } from "./dispatcher/index.js";
+import { Dispatcher, getWorkerIdByTelegramMessage } from "./dispatcher/index.js";
+import { setPoolInfoGetter } from "./concierg/mcp-tools.js";
 import { Watchdog } from "./watchdog/index.js";
 import {
   initTelegramBot,
   setMessageHandler,
   setEditHandler,
+  setCallbackQueryHandler,
   setRestartHandler,
   sendMessage,
+  sendLongMessage,
+  sendQuestionMessage,
   sendPhoto,
   sendTypingAction,
   startBot,
   stopBot,
   getBot,
+  resolveOptionLabel,
+  clearQuestionOptions,
 } from "./telegram/index.js";
 import { HealthMonitor } from "./health/index.js";
 import { startTokenRefreshLoop, stopTokenRefreshLoop } from "./utils/token-refresh.js";
@@ -52,19 +57,26 @@ async function main() {
   // 5. Init Dispatcher
   const dispatcher = new Dispatcher();
 
-  // Wire worker details provider for concierg MCP tools
-  setWorkerDetailsProvider((workerId) => {
-    const output = dispatcher.getWorkerOutput(workerId);
-    if (!output) return null;
+  // Wire pool info getter so concierg's get_system_state shows pool/phase info
+  setPoolInfoGetter((workerId) => {
     const session = dispatcher.getPool().get(workerId);
+    if (!session) return null;
     return {
-      state: output.state,
-      stdout: output.stdout,
-      stderr: output.stderr,
-      events: output.events,
-      totalCostUsd: session?.totalCostUsd ?? 0,
-      hasManagerLLM: dispatcher.hasManagerLLM(workerId),
+      poolStatus: session.isCold() ? 'cold' : 'warm',
+      phase: session.phase,
+      hasPendingPlan: session.hasPendingPlan(),
     };
+  });
+
+  // Wire Telegram functions into dispatcher (for workers to send messages directly)
+  dispatcher.setTelegramFunctions({
+    sendMessage: async (chatId, text) => {
+      const ids = await sendLongMessage(chatId, text, { plain: true });
+      return ids[0] ?? 0;
+    },
+    sendLongMessage: (chatId, text) => sendLongMessage(chatId, text),
+    sendQuestionMessage,
+    sendPhoto,
   });
 
   // 6. Start token refresh loop (keeps OAuth token fresh)
@@ -73,7 +85,7 @@ async function main() {
   // 7. Start Concierg session (Claude Code SDK)
   await startConciergSession();
 
-  // 7. Init Health Monitor
+  // 8. Init Health Monitor
   const health = new HealthMonitor({
     getBot,
     stopBot,
@@ -96,7 +108,7 @@ async function main() {
     await sendPhoto(chatId, photoPath, caption);
   };
 
-  // 8. Wire Telegram -> Concierg -> MCP tools dispatch intents
+  // 9. Wire Telegram -> Concierg -> dispatch intents
   setMessageHandler(async (text, messageId, chatId, replyToMessageId, replyToText, image) => {
     health.trackMessageStart(messageId);
     sendTypingAction(chatId);
@@ -137,6 +149,50 @@ async function main() {
     }
   });
 
+  // 10. Wire callback handler for inline keyboard buttons (questions, plans)
+  setCallbackQueryHandler(async (data, messageId, chatId) => {
+    log.info({ data, messageId, chatId }, "Callback query received");
+
+    // Question answer: "answer:<questionId>:opt:<index>" or "answer:<questionId>:yes/no/skip"
+    if (data.startsWith("answer:")) {
+      const parts = data.split(":");
+      const questionId = parseInt(parts[1], 10);
+      if (isNaN(questionId)) return;
+
+      let answer: string;
+      if (parts[2] === "opt") {
+        const optIndex = parseInt(parts[3], 10);
+        answer = resolveOptionLabel(questionId, optIndex);
+        clearQuestionOptions(questionId);
+      } else if (parts[2] === "skip") {
+        answer = "skip";
+      } else {
+        answer = parts[2]; // "yes" or "no"
+      }
+
+      const resolved = dispatcher.resolveQuestion(questionId, answer);
+      if (!resolved) {
+        log.warn({ questionId, answer }, "Question not found for callback");
+      }
+      return;
+    }
+
+    // Plan approval: "plan:<workerId>:approve" or "plan:<workerId>:reject"
+    if (data.startsWith("plan:")) {
+      const parts = data.split(":");
+      const workerId = parseInt(parts[1], 10);
+      if (isNaN(workerId)) return;
+
+      const action = parts[2];
+      if (action === "approve") {
+        dispatcher.resolvePlan(workerId, "APPROVED: User approved the plan.");
+      } else if (action === "reject") {
+        dispatcher.resolvePlan(workerId, "REJECTED: User rejected the plan. Ask what to change.");
+      }
+      return;
+    }
+  });
+
   // Wire /restart command handler
   setRestartHandler(async () => {
     log.info("Performing graceful restart...");
@@ -161,17 +217,17 @@ async function main() {
     process.exit(0);
   });
 
-  // 9. Cold-register recent workers from DB (no SDK sessions started)
+  // 11. Cold-register recent workers from DB (no SDK sessions started)
   await dispatcher.coldResumeWorkersFromDb();
 
-  // 10. Start Watchdog (only monitors idle workers now)
+  // 12. Start Watchdog (only monitors idle workers now)
   const watchdog = new Watchdog(dispatcher);
   watchdog.start();
 
-  // 11. Start Telegram bot
+  // 13. Start Telegram bot
   await startBot();
 
-  // 12. Start health monitor (after bot is polling)
+  // 14. Start health monitor (after bot is polling)
   health.start();
 
   log.info("Conciergon is running!");

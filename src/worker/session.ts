@@ -13,31 +13,64 @@ import {
   updateWorkerSessionId,
   touchWorkerActivity,
   insertEvent,
+  insertPendingQuestion,
+  updateQuestionTelegramMessageId,
+  answerQuestion,
 } from "../db/queries.js";
 import { WorkerState } from "../types/index.js";
 import type { AskUserQuestionItem } from "../types/index.js";
 import { createChildLogger } from "../utils/logger.js";
 import { buildCleanEnv } from "../utils/env.js";
+import { createWorkerMcpServer, type WorkerMcpContext } from "./mcp-tools.js";
 
 const log = createChildLogger("worker");
 
-export type QuestionHandler = (
-  workerId: number,
-  question: string,
-  toolUseId: string,
-  structuredQuestions?: AskUserQuestionItem[]
-) => Promise<string>;
+import { execSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join as pathJoin } from "node:path";
 
-export type PlanReviewHandler = (
-  workerId: number,
-  plan: string
-) => Promise<string>;
+function findClaudeBinary(): string {
+  if (process.env.CLAUDE_BINARY_PATH && existsSync(process.env.CLAUDE_BINARY_PATH)) {
+    return process.env.CLAUDE_BINARY_PATH;
+  }
+  const localBin = pathJoin(homedir(), ".local", "bin", "claude");
+  if (existsSync(localBin)) return localBin;
+  try {
+    const resolved = execSync("which claude", { encoding: "utf-8" }).trim();
+    if (resolved && existsSync(resolved)) return resolved;
+  } catch {}
+  return "claude";
+}
 
-export type NotificationHandler = (
-  workerId: number,
-  message: string,
-  title?: string
-) => void;
+const CLAUDE_BINARY = findClaudeBinary();
+
+/** Reformat a plan for Telegram using a quick Haiku call. Falls back to raw text on error. */
+async function formatPlanForTelegram(planText: string): Promise<string> {
+  try {
+    const conversation = query({
+      prompt: planText,
+      options: {
+        model: "claude-haiku-4-5-20251001",
+        appendSystemPrompt: "Reformat the following plan for Telegram messenger. Rules: no markdown tables (use bullet points instead), no triple-backtick code blocks (indent with spaces or use inline `code`), keep it concise and scannable, preserve all important info. Output ONLY the reformatted text, nothing else.",
+        maxTurns: 1,
+        pathToClaudeCodeExecutable: CLAUDE_BINARY,
+      },
+    });
+    let result = "";
+    for await (const msg of conversation) {
+      if (msg.type === "assistant" && msg.message?.content) {
+        for (const block of msg.message.content) {
+          if (block.type === "text") result += block.text;
+        }
+      }
+    }
+    return result.trim() || planText;
+  } catch (err) {
+    log.warn({ err }, "Failed to reformat plan for Telegram, using raw text");
+    return planText;
+  }
+}
 
 export type CompletionHandler = (
   workerId: number,
@@ -121,10 +154,34 @@ function summarizeToolUse(toolName: string, input: unknown): string {
   }
 }
 
+/**
+ * Context for direct Telegram communication from the worker.
+ */
+export interface WorkerTelegramContext {
+  chatId: number;
+  emoji: string;
+  sendMessage: (chatId: number, text: string) => Promise<number>;
+  /** Send a long markdown message, auto-chunked and formatted for Telegram HTML */
+  sendLongMessage: (chatId: number, text: string) => Promise<number[]>;
+  sendQuestionMessage: (
+    chatId: number,
+    workerId: number,
+    questionId: number,
+    question: string,
+    options?: Array<{ label: string; description?: string }>,
+    multiSelect?: boolean,
+    emoji?: string,
+  ) => Promise<number>;
+  sendPhoto: (chatId: number, photoPath: string, caption?: string) => Promise<number>;
+  /** Track which worker sent which Telegram message (for reply routing) */
+  trackMessage: (telegramMsgId: number, workerId: number) => void;
+}
+
 export class WorkerLLM {
   readonly id: number;
   readonly projectPath: string;
   readonly prompt: string;
+  private _permissionMode: 'plan' | 'default';
 
   private query: Query | null = null;
   private abortController = new AbortController();
@@ -140,23 +197,79 @@ export class WorkerLLM {
   private lastStdout = "";
   private lastStderr = "";
 
-  onQuestion: QuestionHandler | null = null;
-  onPlanReview: PlanReviewHandler | null = null;
-  onNotification: NotificationHandler | null = null;
+  /** Telegram context for direct communication */
+  private telegramCtx: WorkerTelegramContext;
+
+  /** Per-worker MCP server for Telegram tools */
+  private workerMcpServer: ReturnType<typeof createWorkerMcpServer>;
+
+  /** In-memory question resolvers (keyed by questionId) */
+  private questionResolvers = new Map<number, (answer: string) => void>();
+
+  /** Plan review resolver (only one at a time) */
+  private planResolver: ((decision: string) => void) | null = null;
+
   onCompletion: CompletionHandler | null = null;
 
-  constructor(id: number, projectPath: string, prompt: string) {
+  constructor(
+    id: number,
+    projectPath: string,
+    prompt: string,
+    telegramCtx: WorkerTelegramContext,
+    permissionMode: 'plan' | 'default' = 'plan',
+  ) {
     this.id = id;
     this.projectPath = projectPath;
     this.prompt = prompt;
+    this.telegramCtx = telegramCtx;
+    this._permissionMode = permissionMode;
+
+    // Create per-worker MCP server
+    const mcpCtx: WorkerMcpContext = {
+      workerId: id,
+      emoji: telegramCtx.emoji,
+      chatId: telegramCtx.chatId,
+      sendMessage: telegramCtx.sendMessage,
+      sendPhoto: telegramCtx.sendPhoto,
+      trackMessage: telegramCtx.trackMessage,
+    };
+    this.workerMcpServer = createWorkerMcpServer(mcpCtx);
   }
 
   get state(): WorkerState {
     return this._state;
   }
 
+  get permissionMode(): 'plan' | 'default' {
+    return this._permissionMode;
+  }
+
   get phase(): 'planning' | 'executing' {
     return this.planApproved ? 'executing' : 'planning';
+  }
+
+  /**
+   * Switch worker back to planning mode.
+   * Takes effect on the NEXT query (after current follow-up interrupt).
+   */
+  switchToPlanning(): void {
+    this._permissionMode = 'plan';
+    this.planApproved = false;
+    log.info({ workerId: this.id }, "Switched to planning mode");
+    this.addEvent('state', 'Switched to planning mode');
+    insertEvent(this.id, "mode_switch", { mode: "plan" });
+  }
+
+  /**
+   * Switch worker to execution mode (skip planning).
+   * Takes effect on the NEXT query (after current follow-up interrupt).
+   */
+  switchToExecution(): void {
+    this._permissionMode = 'default';
+    this.planApproved = true;
+    log.info({ workerId: this.id }, "Switched to execution mode");
+    this.addEvent('state', 'Switched to execution mode');
+    insertEvent(this.id, "mode_switch", { mode: "default" });
   }
 
   private setState(state: WorkerState) {
@@ -197,7 +310,7 @@ export class WorkerLLM {
     return this._totalCostUsd;
   }
 
-  /** Build a synthetic error result for notifying the manager of failures. */
+  /** Build a synthetic error result for notifying of failures. */
   private makeErrorResult(): SDKResultMessage {
     return {
       type: "result",
@@ -206,6 +319,40 @@ export class WorkerLLM {
       num_turns: 0,
       session_id: this.sessionId || "",
     } as unknown as SDKResultMessage;
+  }
+
+  /** Resolve a pending question by its ID */
+  resolveQuestion(questionId: number, answer: string): boolean {
+    const resolver = this.questionResolvers.get(questionId);
+    if (resolver) {
+      answerQuestion(questionId, answer);
+      resolver(answer);
+      this.questionResolvers.delete(questionId);
+      log.info({ questionId, answer, workerId: this.id }, "Question resolved");
+      return true;
+    }
+    return false;
+  }
+
+  /** Resolve a pending plan review */
+  resolvePlan(decision: string): boolean {
+    if (this.planResolver) {
+      this.planResolver(decision);
+      this.planResolver = null;
+      log.info({ workerId: this.id, decision: decision.slice(0, 50) }, "Plan resolved");
+      return true;
+    }
+    return false;
+  }
+
+  /** Check if this worker has a pending question with the given ID */
+  hasQuestion(questionId: number): boolean {
+    return this.questionResolvers.has(questionId);
+  }
+
+  /** Check if this worker has a pending plan review */
+  hasPendingPlan(): boolean {
+    return this.planResolver !== null;
   }
 
   private waitForFollowUp(): Promise<string> {
@@ -226,18 +373,40 @@ export class WorkerLLM {
     log.info({ workerId: this.id, project: this.projectPath }, "Starting worker");
 
     const canUseTool: CanUseTool = async (toolName, input, { signal }) => {
-      // Intercept AskUserQuestion — parse structured data, bridge to manager
-      if (toolName === "AskUserQuestion" && this.onQuestion) {
+      // Intercept AskUserQuestion — send directly to Telegram
+      if (toolName === "AskUserQuestion") {
         const parsed = parseAskUserQuestion(input);
 
         this.setState(WorkerState.WaitingInput);
 
-        const answer = await this.onQuestion(
+        // Insert question in DB
+        const questionRow = insertPendingQuestion(this.id, parsed.text, "");
+
+        // Extract structured options for inline keyboard
+        const structuredOptions = parsed.questions.length > 0
+          ? parsed.questions.flatMap(q => q.options)
+          : undefined;
+        const multiSelect = parsed.questions.some(q => q.multiSelect);
+
+        // Send question directly to Telegram with buttons
+        const telegramMsgId = await this.telegramCtx.sendQuestionMessage(
+          this.telegramCtx.chatId,
           this.id,
+          questionRow.id,
           parsed.text,
-          "",
-          parsed.questions
+          structuredOptions && structuredOptions.length > 0 ? structuredOptions : undefined,
+          multiSelect,
+          this.telegramCtx.emoji,
         );
+
+        // Track message for reply routing
+        updateQuestionTelegramMessageId(questionRow.id, telegramMsgId);
+        this.telegramCtx.trackMessage(telegramMsgId, this.id);
+
+        // Wait for user to answer (via button tap or reply)
+        const answer = await new Promise<string>((resolve) => {
+          this.questionResolvers.set(questionRow.id, resolve);
+        });
 
         this.setState(WorkerState.Active);
 
@@ -247,16 +416,37 @@ export class WorkerLLM {
         };
       }
 
-      // Intercept ExitPlanMode — bridge to manager for plan review (exp #1 + #3)
-      // SDK fires canUseTool for ExitPlanMode in plan mode.
-      // On allow → SDK auto-transitions to execution (Write/Edit/Bash then fire canUseTool).
-      // On deny+message → model revises plan and resubmits.
-      if (toolName === "ExitPlanMode" && this.onPlanReview) {
-        const plan = (input as any).plan || JSON.stringify(input);
+      // Intercept ExitPlanMode — send plan directly to Telegram
+      if (toolName === "ExitPlanMode" && this._permissionMode === 'plan') {
+        // Guard: if a plan is already pending approval, don't send a duplicate
+        if (this.planResolver) {
+          return { behavior: "deny" as const, message: "A plan is already pending approval. Wait for the user to respond." };
+        }
+
+        const rawPlan = (input as any).plan || JSON.stringify(input);
+
+        // Guard against empty plans (e.g. '{}' when ExitPlanMode called without plan field)
+        if (!rawPlan || rawPlan.trim() === '' || rawPlan.trim() === '{}') {
+          return {
+            behavior: "deny" as const,
+            message: 'Your plan is empty. Please include the full plan text in the ExitPlanMode call (plan field).',
+          };
+        }
 
         this.setState(WorkerState.WaitingInput);
 
-        const decision = await this.onPlanReview(this.id, plan);
+        // Reformat plan for Telegram (no tables, concise) then send with proper HTML formatting
+        const formattedPlan = await formatPlanForTelegram(rawPlan);
+        const planText = `${this.telegramCtx.emoji} Worker #${this.id} submitted a plan:\n\n${formattedPlan}`;
+        const msgIds = await this.telegramCtx.sendLongMessage(this.telegramCtx.chatId, planText);
+        for (const mid of msgIds) {
+          this.telegramCtx.trackMessage(mid, this.id);
+        }
+
+        // Wait for user to approve/reject
+        const decision = await new Promise<string>((resolve) => {
+          this.planResolver = resolve;
+        });
 
         this.setState(WorkerState.Active);
 
@@ -272,7 +462,7 @@ export class WorkerLLM {
         }
       }
 
-      // All other tools: allow (SDK handles plan mode restrictions for read-only tools)
+      // Allow worker's own MCP tools and standard tools
       return { behavior: "allow" as const, updatedInput: input };
     };
 
@@ -302,29 +492,28 @@ export class WorkerLLM {
     };
 
     const notificationHook: HookCallback = async (hookInput) => {
-      if (
-        hookInput.hook_event_name === "Notification" &&
-        this.onNotification
-      ) {
-        this.onNotification(
-          this.id,
-          hookInput.message,
-          hookInput.title
-        );
+      if (hookInput.hook_event_name === "Notification") {
+        // Send notification directly to Telegram
+        const title = hookInput.title ? `${hookInput.title}: ` : "";
+        const text = `${this.telegramCtx.emoji} #${this.id} ${title}${hookInput.message}`;
+        try {
+          const msgId = await this.telegramCtx.sendMessage(this.telegramCtx.chatId, text);
+          this.telegramCtx.trackMessage(msgId, this.id);
+        } catch (err) {
+          log.error({ err, workerId: this.id }, "Failed to send notification to Telegram");
+        }
       }
       return {};
     };
 
     const preCompactHook: HookCallback = async (hookInput) => {
-      if (
-        hookInput.hook_event_name === "PreCompact" &&
-        this.onNotification
-      ) {
-        this.onNotification(
-          this.id,
-          `Worker #${this.id} is hitting context limit (${hookInput.trigger}). Auto-compacting.`,
-          "Context Limit"
-        );
+      if (hookInput.hook_event_name === "PreCompact") {
+        const text = `${this.telegramCtx.emoji} #${this.id} Context limit (${hookInput.trigger}). Auto-compacting.`;
+        try {
+          await this.telegramCtx.sendMessage(this.telegramCtx.chatId, text);
+        } catch (err) {
+          log.error({ err, workerId: this.id }, "Failed to send compact notification");
+        }
       }
       return {};
     };
@@ -339,11 +528,13 @@ export class WorkerLLM {
       const options: Options = {
         model: "claude-opus-4-6",
         cwd: this.projectPath,
-        permissionMode: 'plan',
+        permissionMode: this._permissionMode,
+        allowedTools: ["mcp__worker_telegram__*"],
         canUseTool,
         abortController: this.abortController,
         env: workerEnv,
-        pathToClaudeCodeExecutable: "/Users/germangurov/.local/bin/claude",
+        pathToClaudeCodeExecutable: CLAUDE_BINARY,
+        mcpServers: { worker_telegram: this.workerMcpServer },
         hooks: {
           PostToolUse: [{ hooks: [postToolUseHook] }],
           Notification: [{ hooks: [notificationHook] }],
@@ -391,9 +582,9 @@ export class WorkerLLM {
             const result = message as SDKResultMessage;
             this._totalCostUsd += result.total_cost_usd;
 
-            // Completion — worker stays Active while waiting for follow-up
+            // Completion — send result directly to Telegram
             touchWorkerActivity(this.id);
-            this.onCompletion?.(this.id, result);
+            this.handleCompletion(result);
 
             // Mark that result was delivered (prevents re-sending on restart)
             insertEvent(this.id, "result_delivered", { subtype: result.subtype });
@@ -404,7 +595,6 @@ export class WorkerLLM {
               break; // outer loop resumes with new query
             } catch (e) {
               if ((e as Error).name === "AbortError") {
-                // Caller (Dispatcher.cleanupWorker) handles pool removal — no state change
                 return;
               }
               throw e;
@@ -413,7 +603,6 @@ export class WorkerLLM {
         }
       } catch (err: unknown) {
         if ((err as Error).name === "AbortError") {
-          // Caller (Dispatcher.cleanupWorker) handles pool removal — no state change
           log.info({ workerId: this.id }, "Worker aborted");
           this.addEvent('message', 'Worker aborted by user');
           return;
@@ -428,17 +617,21 @@ export class WorkerLLM {
         this.lastStderr = errorMsg;
         this.addEvent('error', errorMsg);
 
-        // Notify manager so it can decide to retry or notify user
+        // Send error to Telegram and notify completion handler
+        try {
+          const text = `${this.telegramCtx.emoji} #${this.id} Error: ${errorMsg.slice(0, 500)}`;
+          await this.telegramCtx.sendMessage(this.telegramCtx.chatId, text);
+        } catch { /* ignore send errors */ }
+
         this.onCompletion?.(this.id, this.makeErrorResult());
 
-        // Wait for follow-up (manager may push worker to retry)
+        // Wait for follow-up (user may push worker to retry)
         try {
           const nextMsg = await this.waitForFollowUp();
           followUpToProcess = nextMsg;
           // Fall through to the follow-up resume logic below
         } catch (e) {
           if ((e as Error).name === "AbortError") {
-            // Caller handles pool removal — no state change
             return;
           }
           throw e;
@@ -459,6 +652,29 @@ export class WorkerLLM {
         return;
       }
     }
+  }
+
+  /** Handle worker completion — send result directly to Telegram */
+  private handleCompletion(result: SDKResultMessage): void {
+    const cost = result.total_cost_usd.toFixed(4);
+    const totalCost = this._totalCostUsd.toFixed(4);
+    const resultText = result.subtype === "success"
+      ? result.result?.slice(0, 1000) || "(no output)"
+      : `(error: ${result.subtype})`;
+
+    const text = `${this.telegramCtx.emoji} #${this.id} completed (${result.subtype})\nCost: $${cost} | Total: $${totalCost}\n\n${resultText}`;
+
+    this.telegramCtx.sendMessage(this.telegramCtx.chatId, text)
+      .then((msgId) => this.telegramCtx.trackMessage(msgId, this.id))
+      .catch((err) => log.error({ err, workerId: this.id }, "Failed to send completion to Telegram"));
+
+    insertEvent(this.id, "result", {
+      subtype: result.subtype,
+      cost: result.total_cost_usd,
+      turns: result.num_turns,
+    });
+
+    this.onCompletion?.(this.id, result);
   }
 
   async followUp(message: string): Promise<void> {

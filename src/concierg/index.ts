@@ -77,6 +77,7 @@ export async function processMessage(
       workerId: ri.workerId,
       questionId: ri.questionId,
       emoji: ri.emoji,
+      planMode: ri.planMode,
       telegramMessageId,
       telegramChatId,
       replyToMessageId,

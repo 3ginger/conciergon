@@ -16,7 +16,6 @@ import {
   setMcpContext,
   clearMcpContext,
   getRegisteredIntents,
-  getWorkerDetailsFromProvider,
   type RegisteredIntent,
 } from "./mcp-tools.js";
 
@@ -31,7 +30,29 @@ export interface ImageData {
 }
 
 const QUERY_TIMEOUT_MS = 600_000;
-const CLAUDE_BINARY = "/Users/germangurov/.local/bin/claude";
+import { execSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join as pathJoin } from "node:path";
+
+function findClaudeBinary(): string {
+  // 1. Env override
+  if (process.env.CLAUDE_BINARY_PATH && existsSync(process.env.CLAUDE_BINARY_PATH)) {
+    return process.env.CLAUDE_BINARY_PATH;
+  }
+  // 2. ~/.local/bin/claude (standard install location)
+  const localBin = pathJoin(homedir(), ".local", "bin", "claude");
+  if (existsSync(localBin)) return localBin;
+  // 3. which claude
+  try {
+    const resolved = execSync("which claude", { encoding: "utf-8" }).trim();
+    if (resolved && existsSync(resolved)) return resolved;
+  } catch {}
+  // 4. Fallback — let SDK try "claude" from PATH
+  return "claude";
+}
+
+const CLAUDE_BINARY = findClaudeBinary();
 
 // --- ConciergSession ---
 // Uses Claude Code SDK with global claude binary.
@@ -186,7 +207,6 @@ export class ConciergSession {
       intents: [],
       sendMessage: sendMessageFn,
       sendPhoto: sendPhotoFn ?? (async () => {}),
-      getWorkerDetails: (workerId) => getWorkerDetailsFromProvider(workerId),
     });
 
     const canUseTool: CanUseTool = async (toolName, _input, _options) => {
@@ -216,13 +236,19 @@ export class ConciergSession {
           "- User just chatting → send_telegram_message (no intent needed)",
           "- NEVER spawn a new worker for replies to existing workers. Use follow_up instead.",
           "",
-          "SYSTEM EVENTS from workers arrive with metadata: [Worker #ID | emoji | phase: planning/executing]",
-          "When forwarding worker messages to the user:",
-          "- Prefix with the worker emoji and ID, e.g. '🔍 Worker #47'",
-          "- Show [plan] for planning phase, omit for executing phase",
-          "- For [QUESTION #ID | ...] events: present the question clearly to the user",
-          "- For [RESULT | ...] events: summarize the result for the user",
-          "- For [SPAWN | ...] events: confirm the worker was started",
+          "PLAN MODE CONTROL:",
+          "- By default, set planMode=true when spawning workers (they plan first, then execute after user approval).",
+          "- If the user explicitly says to skip planning, just do it, or no plan mode → set planMode=false.",
+          "- If the user says 'go back to planning', 'wait, let me think', 'rewind', 'stop implementing and re-plan' → register_intent type=rewind, workerId=<ID>, prompt=<user's reason>",
+          "- rewind switches a running/executing worker back to planning mode so the user can re-evaluate the approach.",
+          "",
+          "SYSTEM EVENTS from workers arrive with metadata like [SPAWN | Worker #ID | ...]",
+          "When forwarding system events to the user:",
+          "- For [SPAWN | ...] events: confirm the worker was started with task summary",
+          "- For [ERROR | ...] events: tell the user what went wrong",
+          "- For [STOPPED | ...] events: confirm the worker was stopped",
+          "- Workers communicate directly with the user via Telegram (questions, plans, progress, results).",
+          "- You do NOT need to relay worker questions or results — workers handle that themselves.",
           "- De-duplicate: if multiple events describe the same thing, send one message",
         ].join("\n"),
         allowedTools: ["mcp__concierg__*", "Read"],

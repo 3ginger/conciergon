@@ -95,14 +95,6 @@ export function updateWorkerSessionId(id: number, sessionId: string) {
     .run();
 }
 
-export function updateManagerSessionId(id: number, managerSessionId: string) {
-  return getDb()
-    .update(schema.workers)
-    .set({ managerSessionId })
-    .where(eq(schema.workers.id, id))
-    .run();
-}
-
 export function touchWorkerActivity(id: number) {
   return getDb()
     .update(schema.workers)
