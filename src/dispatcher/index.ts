@@ -1,7 +1,7 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { type SDKResultMessage } from "@anthropic-ai/claude-code";
+import { type SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
 
 import { notifyConcierg } from "../concierg/index.js";
 import {

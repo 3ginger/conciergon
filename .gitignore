@@ -6,6 +6,7 @@ data/
 *.db-journal
 *.db-wal
 *.log
+conciergon.pid
 experiments/
 notes/
 

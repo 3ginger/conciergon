@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { loadConfig } from "./config/index.js";
 import { initDb, closeDb } from "./db/index.js";
 import { scanAndRegisterProjects } from "./utils/project-registry.js";
@@ -30,13 +29,26 @@ import { HealthMonitor } from "./health/index.js";
 import { startTokenRefreshLoop, stopTokenRefreshLoop } from "./utils/token-refresh.js";
 import { createChildLogger } from "./utils/logger.js";
 import { initSentry } from "./utils/sentry.js";
+import { acquirePidfile, releasePidfile } from "./utils/pidfile.js";
 
 const log = createChildLogger("main");
 
 async function main() {
+  // 0. Guard: only run under launchd (PPID 1 on macOS)
+  if (false && process.ppid !== 1) {
+    log.fatal(
+      "Conciergon must be managed by launchd. " +
+      "Use: launchctl kickstart -k gui/$(id -u)/com.conciergon.bot",
+    );
+    process.exit(1);
+  }
+
+  // 0b. Pidfile guard: prevent overlapping instances
+  acquirePidfile();
+
   log.info("Conciergon starting...");
 
-  // 0. Init Sentry (before anything else)
+  // 1. Init Sentry
   initSentry();
 
   // 1. Load config
@@ -159,15 +171,8 @@ async function main() {
     await stopBot();
     closeDb();
 
-    // Spawn a new instance before exiting
-    const child = spawn("node", ["--env-file=.env", "--import", "tsx", "src/index.ts"], {
-      detached: true,
-      stdio: "ignore",
-      cwd: process.cwd(),
-    });
-    child.unref();
-
-    log.info("New process spawned, exiting current process.");
+    releasePidfile();
+    log.info("Exiting — launchd will restart.");
     process.exit(0);
   });
 
@@ -204,6 +209,7 @@ async function main() {
     await stopBot();
     closeDb();
 
+    releasePidfile();
     log.info("Goodbye.");
     process.exit(0);
   };

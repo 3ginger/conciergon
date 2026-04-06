@@ -1,6 +1,6 @@
 import { z } from "zod";
 import cron from "node-cron";
-import { createSdkMcpServer, tool } from "@anthropic-ai/claude-code";
+import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import {
   getConciergContext,
   getWorkerRecentMessages,

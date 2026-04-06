@@ -7,7 +7,7 @@ import {
   type SDKUserMessage,
   type CanUseTool,
   type HookCallback,
-} from "@anthropic-ai/claude-code";
+} from "@anthropic-ai/claude-agent-sdk";
 import {
   updateWorkerState,
   updateWorkerSessionId,
@@ -20,6 +20,7 @@ import {
   answerQuestion,
   getWorkerById,
   getWorkerMessagesSince,
+  getWorkerRecentMessages,
 } from "../db/queries.js";
 import { WorkerState } from "../types/index.js";
 import type { AskUserQuestionItem } from "../types/index.js";
@@ -71,6 +72,8 @@ async function haikuFormat(
     prompt,
     options: {
       model: "claude-haiku-4-5-20251001",
+      systemPrompt: { type: "preset", preset: "claude_code" },
+      settingSources: [],
       maxTurns: 2,
       cwd: FORMATTER_DIR,
       canUseTool: noTools,
@@ -583,6 +586,8 @@ export class WorkerLLM {
     while (true) {
       const options: Options = {
         model: "claude-opus-4-6",
+        systemPrompt: { type: "preset", preset: "claude_code" },
+        settingSources: ["user", "project"],
         cwd: this.projectPath,
         permissionMode: this._permissionMode,
         canUseTool,
@@ -735,8 +740,23 @@ export class WorkerLLM {
     let resultText: string;
     if (result.subtype === "success" && result.result) {
       resultText = await this.callHaiku(result.result, RESULT_INSTRUCTION, result.result, "result formatter");
+    } else if (result.subtype === "success") {
+      // Empty SDK result — load recent assistant messages from DB (same pattern as plan follow-up)
+      const messages = getWorkerRecentMessages(this.id, 3);
+      const fallback = messages
+        .map((m) => {
+          const data = typeof m.data === "string" ? JSON.parse(m.data) : m.data;
+          return (data as any)?.text || "";
+        })
+        .filter(Boolean)
+        .join("\n\n");
+      if (fallback) {
+        resultText = await this.callHaiku(fallback, RESULT_INSTRUCTION, fallback, "result formatter");
+      } else {
+        resultText = "(no output)";
+      }
     } else {
-      resultText = result.subtype === "success" ? "(no output)" : `Error: ${result.subtype}`;
+      resultText = `Error: ${result.subtype}`;
     }
 
     const text = `${this.telegramCtx.emoji} #${this.id} done — $${cost}\n\n${resultText}`;
