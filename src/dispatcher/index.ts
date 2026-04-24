@@ -1,9 +1,6 @@
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { type SDKResultMessage } from "@anthropic-ai/claude-agent-sdk";
-
-import { notifyConcierg } from "../concierg/index.js";
 import {
   getActiveWorkers,
   getAllProjects,
@@ -12,49 +9,39 @@ import {
   getWorkerById,
   getWorkerWithProject,
   hasCompletionEvent,
-  insertEvent,
   insertWorker,
   markIntentProcessed,
   markWorkerStopped,
   updateWorkerState,
 } from "../db/queries.js";
+import {
+  insertEvent,
+  updateMessageWorkerId,
+} from "../db/message-log.js";
 import { getConfig } from "../config/index.js";
 import { WorkerState } from "../types/index.js";
 import { createChildLogger } from "../utils/logger.js";
 import { WorkerLLM, WorkerPool } from "../worker/index.js";
 import type { WorkerTelegramContext } from "../worker/session.js";
+import type { SendContext } from "../telegram/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const GENERAL_WORKER_DIR = join(__dirname, "..", "..", "concierg-workspace", "general-worker");
 
 const log = createChildLogger("dispatcher");
 
-function sanitizeResult(text: string): string {
-  return text.replace(/\/Users\/[^\s"'<>)}\]]+/g, "[path hidden]");
-}
-
 /** Telegram functions injected at startup */
 export interface TelegramFunctions {
-  sendMessage: (chatId: number, text: string) => Promise<number>;
-  sendLongMessage: (chatId: number, text: string) => Promise<number[]>;
+  sendMessage: (chatId: number, text: string, context?: SendContext) => Promise<number>;
+  sendLongMessage: (chatId: number, text: string, context?: SendContext) => Promise<number[]>;
   sendQuestionMessage: (
     chatId: number,
     workerId: number,
-    questionId: number,
     question: string,
     emoji?: string,
+    mode?: string,
   ) => Promise<number>;
-}
-
-/**
- * In-memory map: telegramMsgId → workerId for reply routing.
- * When a worker sends a message to Telegram, we track it here so that
- * when the user replies to that message, we know which worker to route to.
- */
-const messageToWorker = new Map<number, number>();
-
-export function getWorkerIdByTelegramMessage(telegramMsgId: number): number | undefined {
-  return messageToWorker.get(telegramMsgId);
+  sendDocument: (chatId: number, filePath: string, caption?: string, context?: SendContext) => Promise<number>;
 }
 
 export class Dispatcher {
@@ -73,148 +60,131 @@ export class Dispatcher {
     return this.pool;
   }
 
-  getWorkerOutput(workerId: number): {
-    state: string;
-    stdout: string;
-    stderr: string;
-    events: Array<{ timestamp: Date; type: string; content: string }>;
-  } | null {
-    const session = this.pool.get(workerId);
-    if (!session) {
-      const worker = getWorkerById(workerId);
-      if (!worker) return null;
-
-      return {
-        state: worker.state,
-        stdout: '',
-        stderr: '',
-        events: [{ timestamp: new Date(), type: 'info', content: 'Worker not active in pool' }]
-      };
-    }
-
-    const output = session.getLastOutput();
-    return {
-      state: session.state,
-      stdout: output.stdout,
-      stderr: output.stderr,
-      events: output.events
-    };
-  }
-
   async handleIntent(intent: {
     id: number;
     type: string;
-    project: string | null;
-    prompt: string;
-    userSummary?: string;
-    emoji?: string | null;
-    planMode?: boolean;
     workerId: number | null;
-    questionId: number | null;
-    telegramChatId: number;
     telegramMessageId: number;
+    messageRowId: number;
+    data: Record<string, unknown>;
   }): Promise<void> {
     log.info({ intentId: intent.id, type: intent.type }, "Handling intent");
 
     markIntentProcessed(intent.id);
 
+    const d = intent.data;
+    const logWorkerEvent = (workerId: number | null, eventType: import("../types/index.js").EventType, eventData?: Record<string, unknown>) => {
+      if (!workerId) return;
+      insertEvent({ workerId, type: eventType, data: eventData, messageId: intent.messageRowId });
+      updateMessageWorkerId(intent.messageRowId, workerId);
+    };
+
     try {
       switch (intent.type) {
-        case "spawn_worker":
-          await this.spawnWorker(
-            intent.project,
-            intent.prompt,
-            intent.telegramChatId,
-            intent.userSummary,
-            intent.emoji,
-            intent.planMode ?? true,
-          );
+        case "spawn_worker": {
+          await this.spawnWorker({
+            project: d.project as string,
+            prompt: d.prompt as string,
+            emoji: d.emoji as string,
+            planMode: !d.scheduledExec,
+            messageRowId: intent.messageRowId,
+          });
           break;
+        }
 
-        case "follow_up":
-          await this.followUp(intent.workerId, intent.prompt, intent.telegramChatId);
+        case "follow_up": {
+          const prompt = d.prompt as string;
+          logWorkerEvent(intent.workerId, "follow_up", { prompt });
+          await this.followUp(intent.workerId, prompt);
           break;
+        }
 
-        case "approve_plan":
-          await this.approvePlan(intent.workerId);
+        case "approve_plan": {
+          const prompt = d.prompt as string;
+          logWorkerEvent(intent.workerId, "plan_approved", { prompt });
+          await this.approvePlan(intent.workerId, prompt);
           break;
+        }
 
-        case "reject_plan":
-          await this.rejectPlan(intent.workerId, intent.prompt);
+        case "reject_plan": {
+          const prompt = d.prompt as string;
+          logWorkerEvent(intent.workerId, "plan_rejected", { prompt });
+          await this.rejectPlan(intent.workerId, prompt);
           break;
+        }
 
-        case "answer_question":
-          await this.handleAnswer(
-            intent.questionId,
-            intent.prompt,
-          );
+        case "answer_question": {
+          const answer = d.answer as string;
+          logWorkerEvent(intent.workerId, "question_answered", { answer });
+          await this.handleAnswer(intent.workerId, answer);
           break;
+        }
 
-        case "stop":
+        case "terminate":
+          logWorkerEvent(intent.workerId, "worker_terminated");
           await this.stopWorker(intent.workerId);
           break;
 
         case "pause":
+          logWorkerEvent(intent.workerId, "worker_paused");
           await this.pauseWorker(intent.workerId);
           break;
 
-        case "resume":
-        case "restore_worker":
-          await this.resolveWorkerSession(intent.workerId, "restore_worker", "Continue your previous task.");
+        case "resume": {
+          const prompt = d.prompt as string;
+          logWorkerEvent(intent.workerId, "worker_resumed", { prompt });
+          const resolved = this.resolveSession(intent.workerId, "resume");
+          if (resolved && resolved.session.isCold()) {
+            await this.deliverPrompt(resolved.session, resolved.id, prompt);
+          }
           break;
+        }
 
-        case "switch_to_plan":
-          await this.switchToPlan(intent.workerId, intent.prompt);
+        case "switch_to_plan": {
+          const prompt = d.prompt as string;
+          logWorkerEvent(intent.workerId, "mode_switch", { to: "plan", prompt });
+          await this.switchToPlan(intent.workerId, prompt);
           break;
-
-        case "skip_plan":
-          await this.skipPlan(intent.workerId);
-          break;
-
-        case "status":
-          // Concierg handles status via get_system_state + send_telegram_message
-          break;
-
-        case "general":
-          break;
+        }
 
         default:
           log.warn({ type: intent.type }, "Unknown intent type");
       }
     } catch (err) {
       log.error({ err, intentId: intent.id }, "Error handling intent");
-      notifyConcierg(`[ERROR] Intent processing failed: ${(err as Error).message}`);
     }
   }
 
   // --- Telegram context factory ---
 
-  private makeTelegramContext(chatId: number, emoji: string): WorkerTelegramContext {
+  private makeTelegramContext(chatId: number, emoji: string, workerId: number): WorkerTelegramContext {
     if (!this.telegramFns) throw new Error("Telegram functions not set");
+    const workerCtx: SendContext = { source: "worker_progress", workerId };
     return {
       chatId,
       emoji,
-      sendMessage: this.telegramFns.sendMessage,
-      sendLongMessage: this.telegramFns.sendLongMessage,
-      sendQuestionMessage: this.telegramFns.sendQuestionMessage,
-      trackMessage: (telegramMsgId, workerId) => {
-        messageToWorker.set(telegramMsgId, workerId);
-      },
+      workerId,
+      sendMessage: (cId, text) => this.telegramFns!.sendMessage(cId, text, workerCtx),
+      sendLongMessage: (cId, text, ctxOverride?) => this.telegramFns!.sendLongMessage(cId, text, ctxOverride ?? workerCtx),
+      sendQuestionMessage: this.telegramFns!.sendQuestionMessage,
+      sendDocument: (cId, filePath, caption?, ctxOverride?) => this.telegramFns!.sendDocument(cId, filePath, caption, ctxOverride ?? workerCtx),
     };
   }
 
   // --- Spawn ---
 
-  private async spawnWorker(
-    projectName: string | null,
-    prompt: string,
-    chatId: number,
-    userSummary?: string,
-    emoji?: string | null,
-    planMode: boolean = true,
-  ): Promise<void> {
+  private async spawnWorker(opts: {
+    project: string;
+    prompt: string;
+    emoji?: string | null;
+    planMode?: boolean;
+    messageRowId?: number;
+  }): Promise<void> {
+    const { project: projectName, prompt, emoji, planMode = true, messageRowId } = opts;
+    const chatId = getConfig().TELEGRAM_ALLOWED_USERS[0];
+
     if (!projectName) {
-      notifyConcierg("[ERROR] No project specified for spawn");
+      log.error("No project specified for spawn");
       return;
     }
 
@@ -226,7 +196,7 @@ export class Dispatcher {
     if (projectName === "general") {
       const generalProject = getProjectByName("general");
       if (!generalProject) {
-        notifyConcierg("[ERROR] General worker project not found in database");
+        log.error("General worker project not found in database");
         return;
       }
       projectPath = GENERAL_WORKER_DIR;
@@ -237,7 +207,7 @@ export class Dispatcher {
       if (!project) {
         const allProjects = getAllProjects();
         const names = allProjects.map((p) => p.name).join(", ");
-        notifyConcierg(`[ERROR] Project "${projectName}" not found. Available: ${names || "(none)"}`);
+        log.error({ projectName, available: names }, "Project not found");
         return;
       }
       projectPath = project.path;
@@ -245,43 +215,34 @@ export class Dispatcher {
       resolvedProjectName = project.name;
     }
 
-    const workerRow = insertWorker(projectId, prompt, chatId, emoji);
+    const workerRow = insertWorker(projectId, emoji);
     const workerEmoji = emoji || "🔵";
 
-    // Enrich prompt with evidence instructions
-    const enrichedPrompt = prompt + '\n\n' +
-      'When you complete your task, include evidence of success: test results, ' +
-      'file contents, or command output that proves the work is done correctly. ' +
-      'If you are unsure about anything, use AskUserQuestion to ask. ' +
-      'When you are ready to propose a plan, use ExitPlanMode.';
+    if (messageRowId) {
+      updateMessageWorkerId(messageRowId, workerRow.id);
+    }
 
-    const telegramCtx = this.makeTelegramContext(chatId, workerEmoji);
+    insertEvent({
+      workerId: workerRow.id,
+      type: "worker_spawning",
+      data: { prompt, project: resolvedProjectName, planMode },
+      messageId: messageRowId ?? null,
+    });
+
+    const telegramCtx = this.makeTelegramContext(chatId, workerEmoji, workerRow.id);
     const session = new WorkerLLM(
       workerRow.id,
       projectPath,
-      enrichedPrompt,
+      prompt,
       telegramCtx,
       planMode ? 'plan' : 'default',
     );
 
-    // Wire completion callback
-    session.onCompletion = (_wId, _result) => {
-      // Completion is handled inside WorkerLLM.handleCompletion() which sends to Telegram directly
-      // This callback is for additional cleanup if needed
-    };
-
     this.pool.add(session);
 
-    // Notify user via Concierg
-    notifyConcierg(
-      `[SPAWN | Worker #${workerRow.id} | ${workerEmoji} | project: ${resolvedProjectName} | mode: ${planMode ? 'plan' : 'default'}] Task: "${userSummary || prompt}"`
-    );
-
-    // Start worker in background
     session.start().catch((err) => {
       log.error({ err, workerId: workerRow.id }, "Worker start failed");
       updateWorkerState(workerRow.id, WorkerState.Errored);
-      notifyConcierg(`[ERROR | Worker #${workerRow.id}] Failed to start: ${(err as Error).message}`);
       this.removeWorkerFromPool(workerRow.id);
     });
   }
@@ -289,56 +250,23 @@ export class Dispatcher {
   // --- Answer handling ---
 
   private async handleAnswer(
-    questionId: number | null,
+    workerId: number | null,
     answer: string,
   ): Promise<void> {
-    if (questionId) {
-      // Find the worker that owns this question and resolve it
-      for (const session of this.pool.getAll()) {
-        if (session.hasQuestion(questionId)) {
-          session.resolveQuestion(questionId, answer);
-          return;
-        }
-      }
-      log.warn({ questionId }, "No worker found with this question");
-      notifyConcierg("[ERROR] No worker found with this pending question.");
+    if (!workerId) {
+      log.error("answer_question requires workerId");
       return;
     }
 
-    // Try to find a single worker with pending questions
-    const workersWithQuestions = this.pool.getAll().filter(
-      (w) => w.state === WorkerState.WaitingInput
-    );
-
-    if (workersWithQuestions.length === 1) {
-      // Auto-route to the only waiting worker — but we don't know the questionId
-      notifyConcierg("[ERROR] Please reply to the specific question message or tap a button.");
-    } else if (workersWithQuestions.length > 1) {
-      notifyConcierg("[ERROR] Multiple workers waiting. Reply to the specific question.");
-    } else {
-      notifyConcierg("[ERROR] No pending questions to answer.");
-    }
-  }
-
-  /** Resolve a question by ID — called from callback handler */
-  resolveQuestion(questionId: number, answer: string): boolean {
-    for (const session of this.pool.getAll()) {
-      if (session.resolveQuestion(questionId, answer)) {
-        return true;
-      }
-    }
-    log.warn({ questionId }, "No resolver found for question");
-    return false;
-  }
-
-  /** Resolve a plan review for a worker — called from callback handler */
-  resolvePlan(workerId: number, decision: string): boolean {
     const session = this.pool.get(workerId);
-    if (session) {
-      return session.resolvePlan(decision);
+    if (!session) {
+      log.error({ workerId }, "Worker not found in pool");
+      return;
     }
-    log.warn({ workerId }, "No worker found for plan resolution");
-    return false;
+
+    if (!session.resolveQuestion(answer)) {
+      log.warn({ workerId }, "No pending question to answer");
+    }
   }
 
   // --- Session creation from DB ---
@@ -350,9 +278,10 @@ export class Dispatcher {
 
     const { worker, project } = workerData;
     log.info({ workerId }, "Creating session from DB");
-    const telegramCtx = this.makeTelegramContext(worker.telegramChatId, worker.emoji || "🔵");
+    const chatId = getConfig().TELEGRAM_ALLOWED_USERS[0];
+    const telegramCtx = this.makeTelegramContext(chatId, worker.emoji || "🔵", worker.id);
     const restoredMode = (worker.permissionMode as 'plan' | 'default') || 'plan';
-    const session = new WorkerLLM(worker.id, project.path, worker.currentPrompt, telegramCtx, restoredMode);
+    const session = new WorkerLLM(worker.id, project.path, "", telegramCtx, restoredMode);
     session.restorePlanState(restoredMode);
     this.pool.add(session);
     return session;
@@ -361,100 +290,125 @@ export class Dispatcher {
   // --- Worker session resolver (single path for all intents) ---
 
   /**
-   * Resolve a worker session by ID. Handles auto-detection, DB loading, and cold warm-up.
-   * Returns session if warm and ready, null if async warm-up in progress or not found.
+   * Resolve the worker and return its session from the pool (creating a cold one from
+   * DB if needed). Does NOT warm up cold sessions — callers mutate session state first
+   * (e.g. switchToExecution) and then hand off to deliverPrompt.
    */
-  private async resolveWorkerSession(
+  private resolveSession(
     workerId: number | null,
     errorContext: string,
-    pendingMessage?: string,
-  ): Promise<{ session: WorkerLLM; id: number } | null> {
+  ): { session: WorkerLLM; id: number } | null {
     let targetId = workerId;
     if (!targetId) {
       const active = getActiveWorkers();
       if (active.length === 1) {
         targetId = active[0].id;
       } else {
-        notifyConcierg(`[ERROR] ${errorContext}: specify which worker.`);
+        log.error({ errorContext }, "Ambiguous worker: specify which worker");
         return null;
       }
     }
 
     let session: WorkerLLM | undefined = this.pool.get(targetId);
-
-    // Not in pool — try loading from DB (falls through to cold warm-up)
     if (!session) {
       session = this.createSessionFromDb(targetId) ?? undefined;
       if (!session) {
-        notifyConcierg(`[ERROR | Worker #${targetId}] Worker not found or not running.`);
+        log.error({ workerId: targetId }, "Worker not found or not running");
         return null;
       }
     }
+    return { session, id: targetId };
+  }
 
+  /**
+   * Deliver a prompt to a resolved session: warm up the SDK with it as the initial
+   * resume prompt when cold, otherwise interrupt + follow-up. Called AFTER any mode
+   * mutations so the SDK picks up the updated permissionMode on start.
+   */
+  private async deliverPrompt(
+    session: WorkerLLM,
+    id: number,
+    prompt: string,
+  ): Promise<void> {
     if (session.isCold()) {
-      const worker = getWorkerById(targetId);
-      if (worker?.sessionId) {
-        const resumeMsg = pendingMessage
-          ? `[SYSTEM | Worker #${targetId}] Resuming, delivering your message shortly...`
-          : `[SYSTEM | Worker #${targetId}] Resuming...`;
-        notifyConcierg(resumeMsg);
-        session.warmUp(worker.sessionId, pendingMessage)
-          .catch((err) => {
-            log.error({ err, workerId: targetId }, "Worker warm-up failed");
-            updateWorkerState(targetId!, WorkerState.Errored);
-            notifyConcierg(`[ERROR | Worker #${targetId}] Resume failed: ${(err as Error).message}`);
-            this.removeWorkerFromPool(targetId!);
-          });
-      } else {
-        notifyConcierg(`[ERROR | Worker #${targetId}] Worker has no session to resume.`);
+      const worker = getWorkerById(id);
+      if (!worker?.sessionId) {
+        log.error({ workerId: id }, "Worker has no session to resume");
+        return;
       }
-      return null;
+      log.info({ workerId: id }, "Resuming worker");
+      session.warmUp(worker.sessionId, prompt)
+        .catch((err) => {
+          log.error({ err, workerId: id }, "Worker warm-up failed");
+          updateWorkerState(id, WorkerState.Errored);
+          this.removeWorkerFromPool(id);
+        });
+      return;
     }
 
-    return { session, id: targetId };
+    try {
+      await session.followUp(prompt);
+    } catch (err) {
+      log.error({ err, workerId: id }, "Failed to deliver prompt");
+    }
   }
 
   // --- Follow-up ---
 
-  private async followUp(
-    workerId: number | null,
-    message: string,
-    chatId: number
-  ): Promise<void> {
-    const resolved = await this.resolveWorkerSession(workerId, "follow_up", message);
+  private async followUp(workerId: number | null, message: string): Promise<void> {
+    const resolved = this.resolveSession(workerId, "follow_up");
     if (!resolved) return;
     const { session, id } = resolved;
 
-    try {
-      await session.followUp(message);
-    } catch (err) {
-      log.error({ err, workerId: id }, "Failed to send follow-up");
-      notifyConcierg(`[ERROR | Worker #${id}] Worker not found or not running.`);
+    if (session.hasPendingPlan()) {
+      log.info({ workerId: id }, "Follow-up on pending plan — routing as reject_plan");
+      session.rejectPlan(message);
+      return;
     }
+
+    await this.deliverPrompt(session, id, message);
   }
 
   // --- Plan approval / rejection ---
 
-  private async approvePlan(workerId: number | null): Promise<void> {
-    const resolved = await this.resolveWorkerSession(workerId, "approve_plan");
+  private async approvePlan(workerId: number | null, prompt: string): Promise<void> {
+    const resolved = this.resolveSession(workerId, "approve_plan");
     if (!resolved) return;
     const { session, id } = resolved;
-    if (!session.hasPendingPlan()) {
-      notifyConcierg(`[ERROR | Worker #${id}] No pending plan to approve.`);
+
+    if (session.hasPendingPlan()) {
+      // Warm session awaiting ExitPlanMode — let the canUseTool handler flip the mode.
+      session.approvePlan();
+    } else if (session.permissionMode === 'plan') {
+      // Cold session (or warm with no pending plan) still in plan mode — flip explicitly
+      // so the next SDK start picks up permissionMode='default' and the DB reflects reality.
+      session.switchToExecution();
+    } else {
+      log.warn({ workerId: id }, "No pending plan to approve");
       return;
     }
-    session.resolvePlan("APPROVED: User approved the plan.");
+
+    await this.deliverPrompt(session, id, prompt);
   }
 
-  private async rejectPlan(workerId: number | null, feedback: string): Promise<void> {
-    const resolved = await this.resolveWorkerSession(workerId, "reject_plan");
+  private async rejectPlan(workerId: number | null, prompt: string): Promise<void> {
+    const resolved = this.resolveSession(workerId, "reject_plan");
     if (!resolved) return;
     const { session, id } = resolved;
-    if (!session.hasPendingPlan()) {
-      notifyConcierg(`[ERROR | Worker #${id}] No pending plan to reject.`);
+
+    if (session.hasPendingPlan()) {
+      session.rejectPlan(prompt);
       return;
     }
-    session.resolvePlan(`REJECTED: ${feedback}`);
+
+    // Cold session: no in-memory planResolver, but the worker was stopped mid-plan.
+    // Deliver the rejection as the resume prompt so the model revises.
+    if (session.isCold() && session.permissionMode === 'plan') {
+      await this.deliverPrompt(session, id, prompt);
+      return;
+    }
+
+    log.warn({ workerId: id }, "No pending plan to reject");
   }
 
   // --- Stop / Pause / Resume ---
@@ -468,7 +422,7 @@ export class Dispatcher {
       if (active.length === 1) {
         targetId = active[0].id;
       } else {
-        notifyConcierg("[ERROR] Specify which worker to stop.");
+        log.error("Specify which worker to stop");
         return;
       }
     }
@@ -477,88 +431,50 @@ export class Dispatcher {
     if (session) {
       session.abort();
       this.cleanupWorker(targetId);
-      notifyConcierg(`[STOPPED | Worker #${targetId}]`);
     } else {
       markWorkerStopped(targetId);
-      notifyConcierg(`[STOPPED | Worker #${targetId}] Marked stopped in DB.`);
     }
+    log.info({ workerId: targetId }, "Worker stopped");
   }
 
   private async pauseWorker(
     workerId: number | null,
   ): Promise<void> {
     if (!workerId) {
-      notifyConcierg("[ERROR] Specify which worker to pause.");
+      log.error("Specify which worker to pause");
       return;
     }
 
     const session = this.pool.get(workerId);
     if (!session) {
-      notifyConcierg(`[ERROR | Worker #${workerId}] Worker not found.`);
+      log.error({ workerId }, "Worker not found");
       return;
     }
 
     if (session.state === WorkerState.WaitingInput) {
       log.warn({ workerId }, "Cannot pause worker in WaitingInput state");
-      notifyConcierg(`[ERROR | Worker #${workerId}] Worker is waiting for input — can't be paused. Answer the pending question or stop it.`);
       return;
     }
 
     await session.interrupt();
-    notifyConcierg(`[PAUSED | Worker #${workerId}]`);
+    log.info({ workerId }, "Worker paused");
   }
 
-  private async switchToPlan(workerId: number | null, reason: string): Promise<void> {
-    const resolved = await this.resolveWorkerSession(workerId, "switch_to_plan");
+  private async switchToPlan(workerId: number | null, prompt: string): Promise<void> {
+    const resolved = this.resolveSession(workerId, "switch_to_plan");
     if (!resolved) return;
     const { session, id } = resolved;
 
     if (session.phase === 'planning') {
-      notifyConcierg(`[ERROR | Worker #${id}] Worker is already in planning mode.`);
+      log.warn({ workerId: id }, "Worker already in planning mode");
       return;
     }
 
     session.switchToPlanning();
-
-    const followUpMessage = reason
-      ? `STOP current work. User wants to go back to planning mode. Reason: ${reason}\n\nRe-evaluate your approach. Create a new plan based on the user's feedback. Use ExitPlanMode when your plan is ready.`
-      : `STOP current work. User wants to go back to planning mode.\n\nRe-evaluate your approach and create a new plan. Use ExitPlanMode when your plan is ready.`;
-
-    try {
-      await session.followUp(followUpMessage);
-      notifyConcierg(`[SWITCH_TO_PLAN | Worker #${id}] Switched back to planning mode.`);
-    } catch (err) {
-      log.error({ err, workerId: id }, "Failed to switch to plan");
-      notifyConcierg(`[ERROR | Worker #${id}] Failed to switch to plan: ${(err as Error).message}`);
-    }
+    await this.deliverPrompt(session, id, prompt);
+    log.info({ workerId: id }, "Switched back to planning mode");
   }
 
-  private async skipPlan(workerId: number | null): Promise<void> {
-    const resolved = await this.resolveWorkerSession(workerId, "skip_plan");
-    if (!resolved) return;
-    const { session, id } = resolved;
-
-    if (session.hasPendingPlan()) {
-      session.resolvePlan("APPROVED: User wants to skip plan review and execute directly.");
-      notifyConcierg(`[SKIP_PLAN | Worker #${id}] Plan review skipped, executing.`);
-    } else {
-      session.switchToExecution();
-      try {
-        await session.followUp("STOP planning. User wants to skip the plan review step. Do NOT call ExitPlanMode. Start implementing immediately.");
-        notifyConcierg(`[SKIP_PLAN | Worker #${id}] Told worker to skip planning and execute.`);
-      } catch (err) {
-        log.error({ err, workerId: id }, "Failed to skip plan");
-        notifyConcierg(`[ERROR | Worker #${id}] Failed to skip plan: ${(err as Error).message}`);
-      }
-    }
-  }
-
-  // --- Idle ---
-
-  async handleIdleWorker(workerId: number): Promise<void> {
-    notifyConcierg(`[IDLE | Worker #${workerId}] Worker seems idle.`);
-    insertEvent(workerId, "idle_alert", {});
-  }
 
   // --- Cleanup ---
 
@@ -571,20 +487,20 @@ export class Dispatcher {
   cleanupWorker(workerId: number): void {
     this.removeWorkerFromPool(workerId);
     markWorkerStopped(workerId);
-    insertEvent(workerId, "removed", { reason: "cleanup" });
+    insertEvent({ workerId, type: "worker_stopped", data: { reason: "cleanup" } });
   }
 
   async stopAll(): Promise<void> {
     for (const session of this.pool.getAll()) {
       markWorkerStopped(session.id);
-      insertEvent(session.id, "removed", { reason: "shutdown" });
+      insertEvent({ workerId: session.id, type: "worker_stopped", data: { reason: "shutdown" } });
     }
     await this.pool.stopAll();
   }
 
   // --- Startup cleanup ---
 
-  /** Mark stale/completed workers as stopped. Workers are loaded from DB on demand by resolveWorkerSession. */
+  /** Mark stale/completed workers as stopped. Workers are loaded from DB on demand by resolveSession. */
   async cleanupStaleWorkers(): Promise<void> {
     const { WORKER_RESUME_MAX_AGE_S } = getConfig();
     const allActive = getActiveWorkers();
@@ -595,17 +511,17 @@ export class Dispatcher {
       if (!resumableIds.has(worker.id)) {
         log.info({ workerId: worker.id, lastActivity: worker.lastActivityAt }, "Marking stale worker as stopped");
         markWorkerStopped(worker.id);
-        insertEvent(worker.id, "skipped_resume", { reason: "stale" });
+        insertEvent({ workerId: worker.id, type: "worker_stopped", data: { reason: "stale" } });
       }
     }
 
     for (const worker of resumable) {
       if (!worker.sessionId) {
         updateWorkerState(worker.id, WorkerState.Errored);
-        insertEvent(worker.id, "skipped_resume", { reason: "no_session_id" });
+        insertEvent({ workerId: worker.id, type: "worker_error", data: { reason: "no_session_id" } });
       } else if (hasCompletionEvent(worker.id)) {
         markWorkerStopped(worker.id);
-        insertEvent(worker.id, "skipped_resume", { reason: "already_completed" });
+        insertEvent({ workerId: worker.id, type: "worker_stopped", data: { reason: "already_completed" } });
       }
     }
 
