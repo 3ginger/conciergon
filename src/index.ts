@@ -7,8 +7,7 @@ import {
   stopConciergSession,
   pingConciergSession,
 } from "./concierg/index.js";
-import { Dispatcher, getWorkerIdByTelegramMessage } from "./dispatcher/index.js";
-import { setPoolInfoGetter, setSchedulerRef } from "./concierg/mcp-tools.js";
+import { Dispatcher } from "./dispatcher/index.js";
 import { Scheduler } from "./scheduler/index.js";
 import { Watchdog } from "./watchdog/index.js";
 import {
@@ -19,6 +18,7 @@ import {
   sendMessage,
   sendLongMessage,
   sendQuestionMessage,
+  sendDocument,
   sendPhoto,
   sendTypingAction,
   startBot,
@@ -34,58 +34,28 @@ import { acquirePidfile, releasePidfile } from "./utils/pidfile.js";
 const log = createChildLogger("main");
 
 async function main() {
-  // 0. Guard: only run under launchd (PPID 1 on macOS)
-  if (false && process.ppid !== 1) {
-    log.fatal(
-      "Conciergon must be managed by launchd. " +
-      "Use: launchctl kickstart -k gui/$(id -u)/com.conciergon.bot",
-    );
-    process.exit(1);
-  }
-
-  // 0b. Pidfile guard: prevent overlapping instances
   acquirePidfile();
 
   log.info("Conciergon starting...");
 
-  // 1. Init Sentry
   initSentry();
-
-  // 1. Load config
   const config = loadConfig();
   log.info("Config loaded");
-
-  // 2. Init DB
   initDb();
-
-  // 3. Scan and register projects
   scanAndRegisterProjects();
-
-  // 4. Init Telegram bot
   initTelegramBot();
 
-  // 5. Init Dispatcher
   const dispatcher = new Dispatcher();
-
-  // Wire pool info getter so concierg's get_system_state shows pool/phase info
-  setPoolInfoGetter((workerId) => {
-    const session = dispatcher.getPool().get(workerId);
-    if (!session) return null;
-    return {
-      poolStatus: session.isCold() ? 'cold' : 'warm',
-      phase: session.phase,
-      hasPendingPlan: session.hasPendingPlan(),
-    };
-  });
 
   // Wire Telegram functions into dispatcher (for workers to send messages directly)
   dispatcher.setTelegramFunctions({
-    sendMessage: async (chatId, text) => {
-      const ids = await sendLongMessage(chatId, text, { plain: true });
+    sendMessage: async (chatId, text, context) => {
+      const ids = await sendLongMessage(chatId, text, { plain: true, context });
       return ids[0] ?? 0;
     },
-    sendLongMessage: (chatId, text) => sendLongMessage(chatId, text),
+    sendLongMessage: (chatId, text, context) => sendLongMessage(chatId, text, { context }),
     sendQuestionMessage,
+    sendDocument,
   });
 
   // 6. Start token refresh loop (keeps OAuth token fresh)
@@ -107,23 +77,23 @@ async function main() {
     alertChatId: config.TELEGRAM_ALLOWED_USERS[0],
   });
 
-  // Shared sendMessage wrapper for MCP tools (plain text)
+  // Shared sendMessage wrapper for MCP tools (plain text, tagged as concierg)
   const sendPlainMessage = async (chatId: number, text: string) => {
-    await sendMessage(chatId, text, { plain: true });
+    await sendMessage(chatId, text, { plain: true, context: { source: "concierg" } });
   };
 
   // Shared sendPhoto wrapper for MCP tools
   const sendPhotoWrapper = async (chatId: number, photoPath: string, caption?: string) => {
-    await sendPhoto(chatId, photoPath, caption);
+    await sendPhoto(chatId, photoPath, caption, { source: "concierg" });
   };
 
   // 9. Wire Telegram -> Concierg -> dispatch intents
-  setMessageHandler(async (text, messageId, chatId, replyToMessageId, replyToText, images) => {
+  setMessageHandler(async (text, messageId, chatId, replyToMessageId, replyToText, images, messageRowId) => {
     health.trackMessageStart(messageId);
     sendTypingAction(chatId);
     const typingInterval = setInterval(() => sendTypingAction(chatId), 4000);
     try {
-      await processMessage(text, messageId, chatId, replyToMessageId, replyToText, images, {
+      await processMessage(text, messageId, chatId, replyToMessageId, replyToText, images, messageRowId, {
         sendMessage: sendPlainMessage,
         sendPhoto: sendPhotoWrapper,
         handleIntent: (intent) => dispatcher.handleIntent(intent),
@@ -138,12 +108,12 @@ async function main() {
     }
   });
 
-  setEditHandler(async (text, messageId, chatId) => {
+  setEditHandler(async (text, messageId, chatId, messageRowId) => {
     health.trackMessageStart(messageId);
     sendTypingAction(chatId);
     const typingInterval = setInterval(() => sendTypingAction(chatId), 4000);
     try {
-      await processMessage(text, messageId, chatId, null, null, [], {
+      await processMessage(text, messageId, chatId, null, null, [], messageRowId, {
         sendMessage: sendPlainMessage,
         sendPhoto: sendPhotoWrapper,
         handleIntent: (intent) => dispatcher.handleIntent(intent),
@@ -181,7 +151,6 @@ async function main() {
 
   // 12. Start Scheduler (loads enabled schedules from DB)
   const scheduler = new Scheduler(dispatcher);
-  setSchedulerRef(scheduler);
   scheduler.start();
 
   // 13. Start Watchdog (only monitors idle workers now)

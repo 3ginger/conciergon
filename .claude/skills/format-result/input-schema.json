@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "description": "Worker result or follow-up answer with raw activity events for formatting",
+  "required": ["result", "events"],
+  "properties": {
+    "result": {
+      "type": "string",
+      "description": "Worker output text. One of: (1) SDK result string on completion, (2) follow-up answer bundle with USER QUESTION + WORKER RESPONSE + optional UPDATED PLAN, (3) concatenated recent assistant messages when SDK result is empty"
+    },
+    "events": {
+      "type": "array",
+      "description": "Raw worker activity events from DB (filtered to meaningful types only). Same schema as format-plan events.",
+      "items": {
+        "type": "object",
+        "required": ["type", "data", "created_at"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["worker_spawning", "follow_up", "tool_use", "assistant_message", "question_asked", "question_answered", "plan_proposed", "plan_approved", "plan_rejected"]
+          },
+          "data": { "description": "Event payload" },
+          "created_at": { "type": "string" }
+        }
+      }
+    }
+  }
+}

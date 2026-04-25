@@ -1,5 +1,4 @@
 import cron, { type ScheduledTask } from "node-cron";
-import { notifyConcierg } from "../concierg/index.js";
 import {
   getEnabledScheduledTasks,
   getScheduledTaskById,
@@ -87,26 +86,21 @@ export class Scheduler {
       "Executing scheduled task"
     );
 
-    // Notify user via Concierg
-    notifyConcierg(
-      `[SCHEDULED | Schedule #${schedule.id} | ${schedule.emoji || "⏰"} | project: ${project.name}] Running: "${schedule.userSummary}"`
-    );
-
     this.running.add(scheduleId);
     try {
       // Build synthetic intent and route through dispatcher
       const syntheticIntent = {
-        id: 0, // no DB intent row for scheduled executions
+        id: 0,
         type: "spawn_worker" as const,
-        project: project.name,
-        prompt: `[Scheduled task] ${schedule.userSummary}\n\n${schedule.prompt}`,
-        userSummary: `${schedule.emoji || "⏰"} [Scheduled] ${schedule.userSummary}`,
-        emoji: schedule.emoji,
-        planMode: false, // scheduled tasks execute directly
         workerId: null,
-        questionId: null,
-        telegramChatId: schedule.telegramChatId,
-        telegramMessageId: 0, // no originating message
+        telegramMessageId: 0,
+        messageRowId: 0,
+        data: {
+          project: project.name,
+          prompt: `[Scheduled task] ${schedule.userSummary}\n\n${schedule.prompt}`,
+          emoji: schedule.emoji ?? "⏰",
+          scheduledExec: true,
+        },
       };
 
       await this.dispatcher.handleIntent(syntheticIntent);
@@ -128,8 +122,9 @@ export class Scheduler {
       if (updated && updated.errorCount >= updated.maxErrors) {
         updateScheduledTaskEnabled(schedule.id, false);
         this.removeSchedule(schedule.id);
-        notifyConcierg(
-          `[SCHEDULE ERROR | Schedule #${schedule.id}] Disabled after ${updated.errorCount} consecutive failures: "${schedule.userSummary}"`
+        log.warn(
+          { scheduleId: schedule.id, errorCount: updated.errorCount, summary: schedule.userSummary },
+          "Schedule disabled after consecutive failures"
         );
       }
     } finally {

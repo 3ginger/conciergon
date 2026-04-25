@@ -51,7 +51,7 @@ A Telegram bot that manages [Claude Code](https://docs.anthropic.com/en/docs/cla
 
 ```bash
 # 1. Clone
-git clone https://github.com/anthropics/conciergon.git
+git clone https://github.com/3ginger/conciergon.git
 cd conciergon
 
 # 2. Install dependencies
@@ -86,9 +86,8 @@ cp .env.example .env
 | `PROJECTS_DIR` | No | `~/projects` | Directory to scan for projects |
 | `DB_PATH` | No | `./data/conciergon.db` | SQLite database file path |
 | `HEALTH_PORT` | No | `3847` | HTTP health endpoint port |
-| `WATCHDOG_INTERVAL_MS` | No | `1500` | Idle worker check frequency (ms) |
-| `WORKER_IDLE_TIMEOUT_S` | No | `300` | Seconds before worker idle alert |
-| `WORKER_SESSION_TIMEOUT_S` | No | `7200` | Seconds before idle worker cleanup |
+| `WATCHDOG_INTERVAL_MS` | No | `60000` | Watchdog tick frequency (ms) |
+| `WORKER_SESSION_TIMEOUT_S` | No | `7200` | Seconds of inactivity before a worker is cleaned up from the pool |
 | `WORKER_RESUME_MAX_AGE_S` | No | `3600` | Max age for worker session resume |
 | `LOG_LEVEL` | No | `info` | Log level: trace, debug, info, warn, error, fatal |
 | `USER_TIMEZONE` | No | `UTC` | Timezone for scheduled tasks |
@@ -121,10 +120,9 @@ On Linux, the Keychain-based token refresh is unavailable. Use an API key or man
 ```bash
 npm run dev           # Run with tsx (auto-loads .env)
 npm run build         # TypeScript compile to dist/
-npm run db:generate   # Generate Drizzle migrations
-npm run db:migrate    # Apply migrations
-npm run db:studio     # Interactive DB browser
 ```
+
+The schema bootstraps automatically on first run via `CREATE TABLE IF NOT EXISTS` in `src/db/index.ts` — no migration step is required for a fresh install. The `drizzle-kit` tooling (`db:generate` / `db:migrate` / `db:studio`) is available for advanced workflows but is not part of the standard install.
 
 ## Deployment
 

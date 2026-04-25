@@ -40,48 +40,19 @@ function createTables(sqlite: Database.Database) {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       project_id INTEGER NOT NULL REFERENCES projects(id),
       session_id TEXT,
-      haiku_session_id TEXT,
       state TEXT NOT NULL DEFAULT 'starting',
-      current_prompt TEXT NOT NULL,
-      telegram_chat_id INTEGER NOT NULL,
+      emoji TEXT,
+      permission_mode TEXT NOT NULL DEFAULT 'plan',
       last_activity_at TEXT NOT NULL DEFAULT (datetime('now')),
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )`,
     `CREATE TABLE IF NOT EXISTS intents (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       type TEXT NOT NULL,
-      project TEXT,
-      prompt TEXT NOT NULL,
-      worker_id INTEGER REFERENCES workers(id),
-      question_id INTEGER,
       telegram_message_id INTEGER NOT NULL,
-      telegram_chat_id INTEGER NOT NULL,
-      reply_to_message_id INTEGER,
-      processed INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    )`,
-    `CREATE TABLE IF NOT EXISTS events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
       worker_id INTEGER REFERENCES workers(id),
-      type TEXT NOT NULL,
       data TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    )`,
-    `CREATE TABLE IF NOT EXISTS concierg_sessions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      session_id TEXT NOT NULL,
-      state TEXT NOT NULL DEFAULT 'active',
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    )`,
-    `CREATE TABLE IF NOT EXISTS pending_questions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      worker_id INTEGER NOT NULL REFERENCES workers(id),
-      question TEXT NOT NULL,
-      tool_use_id TEXT NOT NULL,
-      telegram_message_id INTEGER,
-      answered INTEGER NOT NULL DEFAULT 0,
-      answer TEXT,
+      processed INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )`,
     `CREATE TABLE IF NOT EXISTS scheduled_tasks (
@@ -100,43 +71,38 @@ function createTables(sqlite: Database.Database) {
       max_errors INTEGER NOT NULL DEFAULT 3,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )`,
+
+    `CREATE TABLE IF NOT EXISTS telegram_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      telegram_message_id INTEGER NOT NULL,
+      telegram_chat_id INTEGER NOT NULL,
+      direction TEXT NOT NULL,
+      source TEXT NOT NULL,
+      text TEXT,
+      image_paths TEXT,
+      reply_to_telegram_message_id INTEGER,
+      worker_id INTEGER REFERENCES workers(id),
+      intent_id INTEGER REFERENCES intents(id),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`,
+    `CREATE TABLE IF NOT EXISTS events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      worker_id INTEGER NOT NULL REFERENCES workers(id),
+      type TEXT NOT NULL,
+      data TEXT,
+      message_id INTEGER REFERENCES telegram_messages(id),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`,
   ];
 
   for (const stmt of statements) {
     sqlite.prepare(stmt).run();
   }
 
-  // Migrations for existing DBs
-  try {
-    sqlite.prepare("ALTER TABLE intents ADD COLUMN user_summary TEXT").run();
-  } catch {
-    // Column already exists — ignore
-  }
-
-  try {
-    sqlite.prepare("ALTER TABLE workers ADD COLUMN emoji TEXT").run();
-  } catch {
-    // Column already exists — ignore
-  }
-
-  try {
-    sqlite.prepare("ALTER TABLE workers ADD COLUMN haiku_session_id TEXT").run();
-  } catch {
-    // Column already exists — ignore
-  }
-
-  try {
-    sqlite.prepare("ALTER TABLE workers ADD COLUMN permission_mode TEXT NOT NULL DEFAULT 'plan'").run();
-  } catch {
-    // Column already exists — ignore
-  }
-
-  // Migrate old worker states to new 4-state enum
-  // idle → active, waiting_approval → waiting_input, paused → active, completed → errored
-  // "stopped" kept as-is (DB-only audit value)
-  sqlite.prepare("UPDATE workers SET state = 'active' WHERE state IN ('idle', 'paused')").run();
-  sqlite.prepare("UPDATE workers SET state = 'waiting_input' WHERE state = 'waiting_approval'").run();
-  sqlite.prepare("UPDATE workers SET state = 'stopped' WHERE state = 'completed'").run();
+  sqlite.prepare("CREATE INDEX IF NOT EXISTS idx_tgmsg_lookup ON telegram_messages(telegram_message_id, telegram_chat_id)").run();
+  sqlite.prepare("CREATE INDEX IF NOT EXISTS idx_tgmsg_worker ON telegram_messages(worker_id, created_at)").run();
+  sqlite.prepare("CREATE INDEX IF NOT EXISTS idx_tgmsg_worker_dir ON telegram_messages(worker_id, direction)").run();
+  sqlite.prepare("CREATE INDEX IF NOT EXISTS idx_events_worker ON events(worker_id, created_at)").run();
 }
 
 export function getDb() {

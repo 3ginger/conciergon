@@ -10,12 +10,8 @@ conciergon.pid
 experiments/
 notes/
 
-# Workspace artifacts (keep CLAUDE.md system prompts)
+# General worker workspace — runtime artifacts only; keep CLAUDE.md
 concierg-workspace/*
-!concierg-workspace/CLAUDE.md
 !concierg-workspace/general-worker/
 concierg-workspace/general-worker/*
 !concierg-workspace/general-worker/CLAUDE.md
-!concierg-workspace/haiku-formatter/
-concierg-workspace/haiku-formatter/*
-!concierg-workspace/haiku-formatter/CLAUDE.md

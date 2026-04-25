@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "description": "Pre-baked Telegram message with reply context and conversation history",
+  "required": ["id", "chat_id", "text", "image_paths", "reply_to", "recent_chat", "recent_worker_events"],
+  "properties": {
+    "id": {
+      "type": "integer",
+      "description": "Database row ID of this message"
+    },
+    "chat_id": {
+      "type": "integer",
+      "description": "Telegram chat ID — use this for send-message --chat-id"
+    },
+    "text": {
+      "type": ["string", "null"],
+      "description": "The user's message text (may be null for image-only messages)"
+    },
+    "image_paths": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Local file paths to attached images — use Read on each to view"
+    },
+    "reply_to": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "description": "The full message the user is replying to (null if standalone)",
+          "required": ["id", "direction", "source", "text", "worker_id"],
+          "properties": {
+            "id": {
+              "type": "integer",
+              "description": "Database row ID of the replied-to message"
+            },
+            "direction": {
+              "type": "string",
+              "enum": ["in", "out"],
+              "description": "in = user's own earlier message, out = system/worker message"
+            },
+            "source": {
+              "type": "string",
+              "description": "Origin: worker_question, worker_plan, worker_progress, worker_result, concierg, user_text, etc."
+            },
+            "text": {
+              "type": ["string", "null"],
+              "description": "Full text of the replied-to message"
+            },
+            "worker_id": {
+              "type": ["integer", "null"],
+              "description": "Which worker sent this message (null if not worker-originated). Key signal for classification."
+            }
+          }
+        }
+      ],
+      "description": "reply_to.direction=out + reply_to.worker_id=N means message targets worker N. reply_to=null or reply_to.direction=in means standalone."
+    },
+    "recent_chat": {
+      "type": "array",
+      "description": "Last 8 messages in this chat for conversational context (chronological order)",
+      "items": {
+        "type": "object",
+        "required": ["direction", "source", "text", "worker_id"],
+        "properties": {
+          "direction": { "type": "string", "enum": ["in", "out"] },
+          "source": { "type": "string" },
+          "text": { "type": ["string", "null"] },
+          "worker_id": { "type": ["integer", "null"] }
+        }
+      }
+    },
+    "recent_worker_events": {
+      "type": "array",
+      "description": "Last 10 events for the worker if this message has worker context (chronological order)",
+      "items": {
+        "type": "object",
+        "required": ["type", "created_at"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "Event type: plan_proposed, question_asked, worker_started, worker_completed, follow_up, etc."
+          },
+          "data": {
+            "description": "Event-specific data"
+          },
+          "created_at": {
+            "type": "string",
+            "description": "ISO timestamp"
+          }
+        }
+      }
+    }
+  }
+}

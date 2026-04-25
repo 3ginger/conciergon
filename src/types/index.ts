@@ -4,14 +4,10 @@ export const INTENT_TYPES = [
   "answer_question",
   "approve_plan",
   "reject_plan",
-  "skip_plan",
   "switch_to_plan",
-  "stop",
+  "terminate",
   "pause",
   "resume",
-  "status",
-  "restore_worker",
-  "general",
 ] as const;
 
 export type IntentType = (typeof INTENT_TYPES)[number];
@@ -32,37 +28,52 @@ export enum WorkerState {
   Errored = "errored",
 }
 
+/** Type-specific data for each intent */
+export type IntentData =
+  | { project: string; prompt: string; emoji: string }  // spawn_worker
+  | { prompt: string }                                   // follow_up, reject_plan, switch_to_plan, approve_plan, resume
+  | { answer: string }                                   // answer_question
+  | Record<string, never>;                               // terminate, pause
+
 export interface ClassifiedIntent {
   type: IntentType;
-  project: string | null;
-  prompt: string;
-  userSummary: string;
   workerId: number | null;
-  questionId: number | null;
-  emoji: string | null;
-  planMode: boolean;
   telegramMessageId: number;
-  telegramChatId: number;
-  replyToMessageId: number | null;
+  data: IntentData;
 }
 
-export interface WorkerInfo {
-  id: number;
-  projectId: number;
-  sessionId: string;
-  state: WorkerState | "stopped";
-  currentPrompt: string;
-  lastActivityAt: string;
-  createdAt: string;
-}
+// --- Event types ---
 
-export interface PendingQuestion {
-  id: number;
-  workerId: number;
-  question: string;
-  telegramMessageId: number | null;
-  resolveCallback?: (answer: string) => void;
-}
+export const EVENT_TYPES = [
+  // Worker lifecycle
+  "worker_spawning",
+  "worker_started",
+  "worker_completed",
+  "worker_stopped",
+  "worker_paused",
+  "worker_resumed",
+  "worker_terminated",
+  "worker_error",
+  // Worker activity
+  "status_change",
+  "mode_switch",
+  "tool_use",
+  "assistant_message",
+  "result_delivered",
+  // User interaction
+  "follow_up",
+  "question_asked",
+  "question_answered",
+  "plan_proposed",
+  "plan_approved",
+  "plan_rejected",
+  "plan_document_send_failed",
+  // Formatter
+  "formatter_started",
+  "formatter_done",
+] as const;
+
+export type EventType = (typeof EVENT_TYPES)[number];
 
 export interface AskUserQuestionOption {
   label: string;
@@ -76,11 +87,3 @@ export interface AskUserQuestionItem {
   options: AskUserQuestionOption[];
 }
 
-export interface ConciergResponse {
-  type: IntentType;
-  project: string | null;
-  prompt: string;
-  workerId: number | null;
-  questionId: number | null;
-  reply: string | null;
-}

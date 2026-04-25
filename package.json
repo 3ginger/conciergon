@@ -1,6 +1,25 @@
 {
   "name": "conciergon",
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "description": "Telegram bot that manages Claude Code worker sessions on your projects",
+  "license": "MIT",
+  "author": "Mycroft",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/3ginger/conciergon.git"
+  },
+  "homepage": "https://github.com/3ginger/conciergon",
+  "bugs": {
+    "url": "https://github.com/3ginger/conciergon/issues"
+  },
+  "keywords": [
+    "telegram",
+    "claude-code",
+    "agent",
+    "automation",
+    "ai",
+    "bot"
+  ],
   "type": "module",
   "scripts": {
     "setup": "node --import tsx src/cli/index.ts setup",
@@ -12,11 +31,12 @@
     "db:studio": "drizzle-kit studio"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.92",
+    "@anthropic-ai/claude-agent-sdk": "^0.2.116",
     "@anthropic-ai/claude-code": "^2.1.92",
     "@anthropic-ai/sdk": "^0.39",
     "@clack/prompts": "^1.1.0",
     "@sentry/node": "^10.38.0",
+    "@types/proper-lockfile": "^4.1.4",
     "better-sqlite3": "^11",
     "commander": "^14.0.3",
     "drizzle-orm": "^0.38",
@@ -25,6 +45,7 @@
     "node-cron": "^4.2.1",
     "pino": "^9",
     "pino-pretty": "^13",
+    "proper-lockfile": "^4.1.2",
     "zod": "^3"
   },
   "devDependencies": {

@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "description": "Worker question from AskUserQuestion tool with activity events for context",
+  "required": ["question", "events"],
+  "properties": {
+    "question": {
+      "type": "string",
+      "description": "Stringified JSON from the AskUserQuestion tool input. Contains questions array, each with: question (text), header (section title), multiSelect (boolean), options (array of {label, description})"
+    },
+    "events": {
+      "type": "array",
+      "description": "Raw worker activity events from DB (filtered to meaningful types only). Provides context for why the question is being asked.",
+      "items": {
+        "type": "object",
+        "required": ["type", "data", "created_at"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["worker_spawning", "follow_up", "tool_use", "assistant_message", "question_asked", "question_answered", "plan_proposed", "plan_approved", "plan_rejected"]
+          },
+          "data": { "description": "Event payload" },
+          "created_at": { "type": "string" }
+        }
+      }
+    }
+  }
+}

@@ -1,6 +1,7 @@
 import type {
   MarkdownIR,
   MarkdownLinkSpan,
+  MarkdownStyleSpan,
   IRRenderer,
   StyleMarker,
   RenderedLink,
@@ -31,6 +32,19 @@ const telegramRenderer: IRRenderer = {
   },
 
   escapeText: escapeHtml,
+
+  resolveStyleMarker(span: MarkdownStyleSpan): StyleMarker | null {
+    if (span.style === "code_block" && span.meta?.language) {
+      return {
+        open: `<pre><code class="language-${escapeHtmlAttr(span.meta.language)}">`,
+        close: "</code></pre>",
+      };
+    }
+    if (span.style === "blockquote" && span.end - span.start > 200) {
+      return { open: "<blockquote expandable>", close: "</blockquote>" };
+    }
+    return null;
+  },
 
   buildLink(link: MarkdownLinkSpan, fullText: string): RenderedLink | null {
     const href = link.href.trim();
@@ -102,7 +116,8 @@ function renderIR(ir: MarkdownIR, renderer: IRRenderer): string {
 
     for (const s of activeStyles) {
       if (s.start === pos) {
-        const marker = styleMarkers[s.style]!;
+        const resolved = renderer.resolveStyleMarker?.(s);
+        const marker = resolved || styleMarkers[s.style]!;
         openings.push({ open: marker.open, close: marker.close, end: s.end });
       }
     }

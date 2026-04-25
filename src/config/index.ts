@@ -15,8 +15,7 @@ const envSchema = z.object({
     .string()
     .default("./data/conciergon.db")
     .transform((p) => resolve(p)),
-  WATCHDOG_INTERVAL_MS: z.coerce.number().default(1500),
-  WORKER_IDLE_TIMEOUT_S: z.coerce.number().default(300),
+  WATCHDOG_INTERVAL_MS: z.coerce.number().default(60000),
   WORKER_SESSION_TIMEOUT_S: z.coerce.number().default(7200),
   WORKER_RESUME_MAX_AGE_S: z.coerce.number().default(3600),
   LOG_LEVEL: z

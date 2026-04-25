@@ -17,7 +17,6 @@ interface KeychainCredentials {
     subscriptionType: string;
     rateLimitTier: string;
   };
-  mcpOAuth?: Record<string, unknown>;
 }
 
 function readKeychain(): KeychainCredentials | null {

@@ -6,7 +6,9 @@ interface RenderTarget {
   text: string;
   styles: MarkdownStyleSpan[];
   links: MarkdownLinkSpan[];
-  openStyles: Array<{ style: MarkdownStyle; start: number }>;
+  openStyles: Array<{ style: MarkdownStyle; start: number; meta?: Record<string, string> }>;
+  listStack: Array<{ ordered: boolean; counter: number }>;
+  currentHeadingTag: string;
   tableCol: number;
   tableHeaderCols: number;
 }
@@ -34,6 +36,8 @@ export function markdownToIR(
     styles: [],
     links: [],
     openStyles: [],
+    listStack: [],
+    currentHeadingTag: "",
     tableCol: 0,
     tableHeaderCols: 0,
   };
@@ -101,7 +105,14 @@ function renderTokens(
         closeStyle(target, "code");
         break;
 
-      case "fence":
+      case "fence": {
+        const lang = token.info.trim();
+        openStyle(target, "code_block", lang ? { language: lang } : undefined);
+        target.text += token.content.replace(/\n$/, "");
+        closeStyle(target, "code_block");
+        target.text += "\n";
+        break;
+      }
       case "code_block":
         openStyle(target, "code_block");
         target.text += token.content.replace(/\n$/, "");
@@ -123,11 +134,20 @@ function renderTokens(
       }
 
       case "heading_open":
-        if (ctx.headingStyle === "bold") openStyle(target, "bold");
+        target.currentHeadingTag = token.tag;
+        if (ctx.headingStyle === "bold") {
+          openStyle(target, "bold");
+          if (token.tag >= "h3") openStyle(target, "italic");
+        }
         break;
       case "heading_close":
-        if (ctx.headingStyle === "bold") closeStyle(target, "bold");
+        if (ctx.headingStyle === "bold") {
+          if (target.currentHeadingTag >= "h3") closeStyle(target, "italic");
+          closeStyle(target, "bold");
+        }
         target.text += "\n";
+        if (target.currentHeadingTag === "h1") target.text += "━━━\n";
+        target.currentHeadingTag = "";
         break;
 
       case "blockquote_open":
@@ -144,14 +164,28 @@ function renderTokens(
         break;
 
       case "bullet_list_open":
-      case "ordered_list_open":
+        target.listStack.push({ ordered: false, counter: 0 });
+        break;
+      case "ordered_list_open": {
+        const start = Number(token.attrGet("start")) || 1;
+        target.listStack.push({ ordered: true, counter: start });
+        break;
+      }
       case "bullet_list_close":
       case "ordered_list_close":
+        target.listStack.pop();
         break;
 
-      case "list_item_open":
-        target.text += "- ";
+      case "list_item_open": {
+        const list = target.listStack[target.listStack.length - 1];
+        if (list?.ordered) {
+          target.text += `${list.counter}. `;
+          list.counter++;
+        } else {
+          target.text += "- ";
+        }
         break;
+      }
       case "list_item_close":
         if (!target.text.endsWith("\n")) target.text += "\n";
         break;
@@ -221,17 +255,19 @@ function renderTokens(
   }
 }
 
-function openStyle(target: RenderTarget, style: MarkdownStyle): void {
-  target.openStyles.push({ style, start: target.text.length });
+function openStyle(target: RenderTarget, style: MarkdownStyle, meta?: Record<string, string>): void {
+  target.openStyles.push({ style, start: target.text.length, meta });
 }
 
 function closeStyle(target: RenderTarget, style: MarkdownStyle): void {
   for (let i = target.openStyles.length - 1; i >= 0; i--) {
     if (target.openStyles[i].style === style) {
-      const { start } = target.openStyles[i];
+      const { start, meta } = target.openStyles[i];
       target.openStyles.splice(i, 1);
       if (target.text.length > start) {
-        target.styles.push({ start, end: target.text.length, style });
+        const span: MarkdownStyleSpan = { start, end: target.text.length, style };
+        if (meta) span.meta = meta;
+        target.styles.push(span);
       }
       return;
     }

@@ -1,7 +1,9 @@
 import { eq, and, sql, desc } from "drizzle-orm";
 import { getDb, schema } from "./index.js";
 import type { ClassifiedIntent } from "../types/index.js";
-import { WorkerState } from "../types/index.js";
+import { INTENT_TYPES, WorkerState } from "../types/index.js";
+
+const INTENT_TYPE_SET = new Set<string>(INTENT_TYPES);
 
 // --- Projects ---
 
@@ -30,18 +32,30 @@ export function getProjectByName(name: string) {
 // --- Intents ---
 
 export function insertIntent(intent: ClassifiedIntent) {
+  if (!INTENT_TYPE_SET.has(intent.type)) {
+    throw new Error(`Invalid intent type: "${intent.type}". Valid: ${INTENT_TYPES.join(", ")}`);
+  }
+  const d = intent.data as Record<string, unknown>;
+  switch (intent.type) {
+    case "spawn_worker":
+      if (!d.project || !d.prompt || !d.emoji) throw new Error("spawn_worker requires project, prompt, emoji");
+      break;
+    case "follow_up":
+    case "reject_plan":
+    case "switch_to_plan":
+      if (!d.prompt && intent.type === "follow_up") throw new Error("follow_up requires prompt");
+      break;
+    case "answer_question":
+      break;
+  }
+
   return getDb()
     .insert(schema.intents)
     .values({
       type: intent.type,
-      project: intent.project,
-      prompt: intent.prompt,
-      userSummary: intent.userSummary,
-      workerId: intent.workerId,
-      questionId: intent.questionId,
       telegramMessageId: intent.telegramMessageId,
-      telegramChatId: intent.telegramChatId,
-      replyToMessageId: intent.replyToMessageId,
+      workerId: intent.workerId,
+      data: intent.data,
     })
     .returning()
     .get();
@@ -68,13 +82,11 @@ export function markIntentProcessed(id: number) {
 
 export function insertWorker(
   projectId: number,
-  prompt: string,
-  telegramChatId: number,
   emoji?: string | null
 ) {
   return getDb()
     .insert(schema.workers)
-    .values({ projectId, currentPrompt: prompt, telegramChatId, ...(emoji ? { emoji } : {}) })
+    .values({ projectId, ...(emoji ? { emoji } : {}) })
     .returning()
     .get();
 }
@@ -91,14 +103,6 @@ export function updateWorkerSessionId(id: number, sessionId: string) {
   return getDb()
     .update(schema.workers)
     .set({ sessionId })
-    .where(eq(schema.workers.id, id))
-    .run();
-}
-
-export function updateWorkerHaikuSessionId(id: number, haikuSessionId: string) {
-  return getDb()
-    .update(schema.workers)
-    .set({ haikuSessionId })
     .where(eq(schema.workers.id, id))
     .run();
 }
@@ -186,7 +190,7 @@ export function getResumableWorkers(maxAgeSec: number) {
     .all();
 }
 
-/** Check if a worker has any completion event (result or result_delivered). */
+/** Check if a worker has any completion event (result_delivered or worker_completed). */
 export function hasCompletionEvent(workerId: number): boolean {
   const row = getDb()
     .select({ id: schema.events.id })
@@ -194,29 +198,12 @@ export function hasCompletionEvent(workerId: number): boolean {
     .where(
       and(
         eq(schema.events.workerId, workerId),
-        sql`${schema.events.type} IN ('result_delivered', 'result')`
+        sql`${schema.events.type} IN ('result_delivered', 'worker_completed')`
       )
     )
     .limit(1)
     .get();
   return !!row;
-}
-
-// --- Events ---
-
-export function insertEvent(
-  workerId: number | null,
-  type: string,
-  data?: unknown
-) {
-  return getDb()
-    .insert(schema.events)
-    .values({
-      workerId,
-      type,
-      data: data ? JSON.stringify(data) : null,
-    })
-    .run();
 }
 
 // --- Worker messages (assistant text from DB) ---
@@ -251,115 +238,20 @@ export function getWorkerMessagesSince(workerId: number, sinceIso: string) {
     .all();
 }
 
-// --- Pending Questions ---
+// --- Recoverable workers (stopped/errored but have sessionId, could be resumed) ---
 
-export function insertPendingQuestion(
-  workerId: number,
-  question: string,
-  toolUseId: string
-) {
-  return getDb()
-    .insert(schema.pendingQuestions)
-    .values({ workerId, question, toolUseId })
-    .returning()
-    .get();
-}
-
-export function updateQuestionTelegramMessageId(
-  id: number,
-  telegramMessageId: number
-) {
-  return getDb()
-    .update(schema.pendingQuestions)
-    .set({ telegramMessageId })
-    .where(eq(schema.pendingQuestions.id, id))
-    .run();
-}
-
-export function answerQuestion(id: number, answer: string) {
-  return getDb()
-    .update(schema.pendingQuestions)
-    .set({ answered: true, answer })
-    .where(eq(schema.pendingQuestions.id, id))
-    .run();
-}
-
-export function getUnansweredQuestions() {
-  return getDb()
-    .select()
-    .from(schema.pendingQuestions)
-    .where(eq(schema.pendingQuestions.answered, false))
-    .all();
-}
-
-export function getQuestionByTelegramMessageId(telegramMessageId: number) {
-  return getDb()
-    .select()
-    .from(schema.pendingQuestions)
-    .where(
-      eq(schema.pendingQuestions.telegramMessageId, telegramMessageId)
-    )
-    .get();
-}
-
-export function getQuestionById(id: number) {
-  return getDb()
-    .select()
-    .from(schema.pendingQuestions)
-    .where(eq(schema.pendingQuestions.id, id))
-    .get();
-}
-
-// --- Concierg Sessions ---
-
-export function getActiveConciergSessionId(): string | null {
-  const row = getDb()
-    .select()
-    .from(schema.conciergSessions)
-    .where(eq(schema.conciergSessions.state, "active"))
-    .orderBy(desc(schema.conciergSessions.id))
-    .limit(1)
-    .get();
-  return row?.sessionId ?? null;
-}
-
-export function saveConciergSessionId(sessionId: string) {
-  const db = getDb();
-  // Mark all existing active sessions as stopped
-  db.update(schema.conciergSessions)
-    .set({ state: "stopped", updatedAt: sql`datetime('now')` })
-    .where(eq(schema.conciergSessions.state, "active"))
-    .run();
-  // Insert new active session
-  return db
-    .insert(schema.conciergSessions)
-    .values({ sessionId })
-    .returning()
-    .get();
-}
-
-export function stopConciergSessions() {
-  return getDb()
-    .update(schema.conciergSessions)
-    .set({ state: "stopped", updatedAt: sql`datetime('now')` })
-    .where(eq(schema.conciergSessions.state, "active"))
-    .run();
-}
-
-// --- Recoverable workers (stopped but have sessionId, could be resumed) ---
-
-export function getStoppedRecoverableWorkers() {
+export function getRecoverableWorkers() {
   return getDb()
     .select()
     .from(schema.workers)
     .where(
       and(
-        eq(schema.workers.state, "stopped"),
+        sql`${schema.workers.state} IN ('stopped', 'errored')`,
         sql`${schema.workers.sessionId} IS NOT NULL AND ${schema.workers.sessionId} != ''`
       )
     )
     .orderBy(desc(schema.workers.lastActivityAt))
-    .limit(10)
+    .limit(20)
     .all();
 }
 
@@ -472,12 +364,132 @@ export function resetScheduleErrorCount(id: number) {
     .run();
 }
 
+// --- Message Payload (for skill pre-baking) ---
+
+interface MessagePayloadReplyTo {
+  id: number;
+  direction: string;
+  source: string;
+  text: string | null;
+  worker_id: number | null;
+}
+
+interface MessagePayload {
+  id: number;
+  chat_id: number;
+  text: string | null;
+  image_paths: string[];
+  reply_to: MessagePayloadReplyTo | null;
+  recent_chat: Array<{
+    direction: string;
+    source: string;
+    text: string | null;
+    worker_id: number | null;
+  }>;
+  recent_worker_events: Array<{
+    type: string;
+    data: unknown;
+    created_at: string;
+  }>;
+}
+
+function fetchMessageRow(id: number) {
+  return getDb()
+    .select()
+    .from(schema.telegramMessages)
+    .where(eq(schema.telegramMessages.id, id))
+    .get();
+}
+
+function fetchMessageByTelegramId(telegramMessageId: number, chatId: number) {
+  return getDb()
+    .select()
+    .from(schema.telegramMessages)
+    .where(
+      and(
+        eq(schema.telegramMessages.telegramMessageId, telegramMessageId),
+        eq(schema.telegramMessages.telegramChatId, chatId),
+      ),
+    )
+    .orderBy(desc(schema.telegramMessages.id))
+    .limit(1)
+    .get();
+}
+
+export function loadMessagePayload(messageRowId: number): MessagePayload | null {
+  const row = fetchMessageRow(messageRowId);
+  if (!row) return null;
+
+  const imagePaths: string[] = row.imagePaths
+    ? (typeof row.imagePaths === "string" ? JSON.parse(row.imagePaths) : row.imagePaths) as string[]
+    : [];
+
+  let replyTo: MessagePayloadReplyTo | null = null;
+  if (row.replyToTelegramMessageId) {
+    const replyRow = fetchMessageByTelegramId(row.replyToTelegramMessageId, row.telegramChatId);
+    if (replyRow) {
+      replyTo = {
+        id: replyRow.id,
+        direction: replyRow.direction,
+        source: replyRow.source,
+        text: replyRow.text,
+        worker_id: replyRow.workerId,
+      };
+    }
+  }
+
+  const recentMessages = getDb()
+    .select({
+      direction: schema.telegramMessages.direction,
+      source: schema.telegramMessages.source,
+      text: schema.telegramMessages.text,
+      workerId: schema.telegramMessages.workerId,
+    })
+    .from(schema.telegramMessages)
+    .where(eq(schema.telegramMessages.telegramChatId, row.telegramChatId))
+    .orderBy(desc(schema.telegramMessages.id))
+    .limit(8)
+    .all()
+    .reverse();
+
+  let recentEvents: Array<{ type: string; data: unknown; created_at: string }> = [];
+  if (row.workerId) {
+    recentEvents = getDb()
+      .select({
+        type: schema.events.type,
+        data: schema.events.data,
+        created_at: schema.events.createdAt,
+      })
+      .from(schema.events)
+      .where(eq(schema.events.workerId, row.workerId))
+      .orderBy(desc(schema.events.id))
+      .limit(10)
+      .all()
+      .reverse()
+      .map((e) => ({ type: e.type, data: e.data, created_at: e.created_at }));
+  }
+
+  return {
+    id: row.id,
+    chat_id: row.telegramChatId,
+    text: row.text,
+    image_paths: imagePaths,
+    reply_to: replyTo,
+    recent_chat: recentMessages.map((m) => ({
+      direction: m.direction,
+      source: m.source,
+      text: m.text,
+      worker_id: m.workerId,
+    })),
+    recent_worker_events: recentEvents,
+  };
+}
+
 // --- Context for Concierg ---
 
 export function getConciergContext() {
   const projectList = getAllProjects();
   const activeWorkerList = getActiveWorkers();
-  const recoverableWorkerList = getStoppedRecoverableWorkers();
-  const pendingQs = getUnansweredQuestions();
-  return { projects: projectList, activeWorkers: activeWorkerList, recoverableWorkers: recoverableWorkerList, pendingQuestions: pendingQs };
+  const recoverableWorkerList = getRecoverableWorkers();
+  return { projects: projectList, activeWorkers: activeWorkerList, recoverableWorkers: recoverableWorkerList };
 }

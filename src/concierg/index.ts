@@ -1,7 +1,7 @@
-import { insertIntent } from "../db/queries.js";
+import { markIntentProcessed } from "../db/queries.js";
+import { updateMessageIntentId } from "../db/message-log.js";
 import type { ClassifiedIntent } from "../types/index.js";
-import { ConciergSession } from "./session.js";
-import type { ImageData } from "./session.js";
+import { ConciergSession, type ImageData } from "./session.js";
 import { createChildLogger } from "../utils/logger.js";
 
 const log = createChildLogger("concierg");
@@ -28,64 +28,44 @@ export async function pingConciergSession(): Promise<boolean> {
   return session.ping();
 }
 
-export function notifyConcierg(eventText: string): void {
-  session?.notify(eventText);
-}
-
 // --- Main processMessage function ---
-// All messages (text and image) go through the same session.
-// Claude uses MCP tools to send messages and register intents.
+// Per message: hand the DB row id to the skill, then dispatch whatever intents it published.
 
 export async function processMessage(
-  message: string,
+  _message: string,
   telegramMessageId: number,
-  telegramChatId: number,
-  replyToMessageId: number | null,
-  replyToText: string | null,
-  images: ImageData[] = [],
+  _telegramChatId: number,
+  _replyToMessageId: number | null,
+  _replyToText: string | null,
+  _images: ImageData[] = [],
+  messageRowId: number,
   deps: {
     sendMessage: (chatId: number, text: string) => Promise<void>;
     sendPhoto: (chatId: number, photoPath: string, caption?: string) => Promise<void>;
-    handleIntent: (intent: ClassifiedIntent & { id: number }) => Promise<void>;
+    handleIntent: (intent: ClassifiedIntent & { id: number; messageRowId: number }) => Promise<void>;
   },
 ): Promise<void> {
-  // Ensure session is alive
   if (!session || !session.isAlive()) {
     log.warn("Concierg session not alive, restarting");
     session = new ConciergSession();
     await session.start();
   }
 
-  const registeredIntents = await session.send(
-    message,
-    telegramMessageId,
-    telegramChatId,
-    replyToMessageId,
-    replyToText,
-    images,
-    deps.sendMessage,
-    deps.sendPhoto,
-  );
+  const registeredIntents = await session.send(messageRowId, telegramMessageId);
 
-  // Process each registered intent
   for (const ri of registeredIntents) {
     const intent: ClassifiedIntent = {
       type: ri.type,
-      project: ri.project,
-      prompt: ri.prompt,
-      userSummary: ri.userSummary,
       workerId: ri.workerId,
-      questionId: ri.questionId,
-      emoji: ri.emoji,
-      planMode: ri.planMode,
       telegramMessageId,
-      telegramChatId,
-      replyToMessageId,
+      data: ri.data as import("../types/index.js").IntentData,
     };
 
-    const row = insertIntent(intent);
-    log.info({ type: row.type, project: row.project, intentId: row.id }, "Intent registered: %s", ri.type);
+    updateMessageIntentId(messageRowId, ri.id);
+    markIntentProcessed(ri.id);
 
-    await deps.handleIntent({ ...intent, id: row.id });
+    log.info({ type: ri.type, intentId: ri.id }, "Intent registered: %s", ri.type);
+
+    await deps.handleIntent({ ...intent, id: ri.id, messageRowId });
   }
 }

@@ -13,3 +13,4 @@ export type {
 
 export { markdownToIR } from "./ir.js";
 export { chunkIR } from "./chunking.js";
+export { markdownToHtmlDocument } from "./html-document.js";

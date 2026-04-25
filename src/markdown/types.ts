@@ -13,6 +13,7 @@ export interface MarkdownStyleSpan {
   start: number;
   end: number;
   style: MarkdownStyle;
+  meta?: Record<string, string>;
 }
 
 /** Link span — a range of characters that is a hyperlink */
@@ -68,4 +69,5 @@ export interface IRRenderer {
   styleMarkers: Partial<Record<MarkdownStyle, StyleMarker>>;
   escapeText(text: string): string;
   buildLink?(link: MarkdownLinkSpan, fullText: string): RenderedLink | null;
+  resolveStyleMarker?(span: MarkdownStyleSpan): StyleMarker | null;
 }

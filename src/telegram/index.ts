@@ -5,10 +5,17 @@ import { getConfig } from "../config/index.js";
 import { createChildLogger } from "../utils/logger.js";
 import { captureException } from "../utils/sentry.js";
 import { markdownToTelegramHtml, markdownToTelegramChunks, escapeHtml, stripHtmlTags } from "./format.js";
+import { insertTelegramMessage, type TelegramMessageInsert } from "../db/message-log.js";
 import type { ImageData } from "../concierg/session.js";
 export type { ImageData };
 
 const log = createChildLogger("telegram");
+
+/** Context passed to send functions to log outgoing messages */
+export interface SendContext {
+  source: string;
+  workerId?: number;
+}
 
 export type MessageHandler = (
   text: string,
@@ -17,12 +24,14 @@ export type MessageHandler = (
   replyToMessageId: number | null,
   replyToText: string | null,
   images: ImageData[],
+  messageRowId: number,
 ) => Promise<void>;
 
 export type EditHandler = (
   text: string,
   messageId: number,
-  chatId: number
+  chatId: number,
+  messageRowId: number,
 ) => Promise<void>;
 
 export type CallbackQueryHandler = (
@@ -128,14 +137,48 @@ async function processMediaGroup(mediaGroupId: string): Promise<void> {
   const text = group.caption || `[User sent ${images.length} photo${images.length > 1 ? "s" : ""} with no caption]`;
   const firstMessageId = group.photos[0].messageId;
 
+  let msgRowId = 0;
   try {
-    await messageHandler(text, firstMessageId, group.chatId, group.replyTo, group.replyToText, images);
+    msgRowId = insertTelegramMessage({
+      telegramMessageId: firstMessageId,
+      telegramChatId: group.chatId,
+      direction: "in",
+      source: "user_photo",
+      text,
+      imagePaths: images.map(img => img.localPath),
+      replyToTelegramMessageId: group.replyTo,
+    }).id;
+  } catch (err) {
+    log.warn({ err }, "Failed to log incoming media group");
+  }
+
+  try {
+    await messageHandler(text, firstMessageId, group.chatId, group.replyTo, group.replyToText, images, msgRowId);
   } catch (err) {
     log.error({ err }, "Error handling media group");
     try {
       await bot!.api.sendMessage(group.chatId, "Internal error processing your photos.");
     } catch { /* ignore send errors */ }
   }
+}
+
+// --- Deduplication: prevent processing the same Telegram update twice ---
+// grammy's long polling can redeliver updates when processMessage blocks for
+// several seconds (Claude SDK queries). Track recently seen message IDs.
+const seenMessageIds = new Set<number>();
+const DEDUP_MAX = 500;
+
+function isDuplicateMessage(messageId: number): boolean {
+  if (seenMessageIds.has(messageId)) return true;
+  seenMessageIds.add(messageId);
+  if (seenMessageIds.size > DEDUP_MAX) {
+    // Evict oldest half (Set preserves insertion order)
+    const iter = seenMessageIds.values();
+    for (let i = 0; i < DEDUP_MAX / 2; i++) {
+      seenMessageIds.delete(iter.next().value!);
+    }
+  }
+  return false;
 }
 
 export function initTelegramBot(): Bot {
@@ -163,16 +206,35 @@ export function initTelegramBot(): Bot {
   bot.on("message:text", async (ctx) => {
     if (!messageHandler) return;
 
-    const text = ctx.message.text;
     const messageId = ctx.message.message_id;
+    if (isDuplicateMessage(messageId)) {
+      log.debug({ messageId }, "Duplicate message skipped");
+      return;
+    }
+
+    const text = ctx.message.text;
     const chatId = ctx.chat.id;
     const replyTo = ctx.message.reply_to_message?.message_id ?? null;
     const replyToText = ctx.message.reply_to_message?.text ?? null;
 
     log.debug({ text, messageId, chatId, replyTo }, "Received message");
 
+    let msgRowId = 0;
     try {
-      await messageHandler(text, messageId, chatId, replyTo, replyToText, []);
+      msgRowId = insertTelegramMessage({
+        telegramMessageId: messageId,
+        telegramChatId: chatId,
+        direction: "in",
+        source: "user_text",
+        text,
+        replyToTelegramMessageId: replyTo,
+      }).id;
+    } catch (err) {
+      log.warn({ err }, "Failed to log incoming message");
+    }
+
+    try {
+      await messageHandler(text, messageId, chatId, replyTo, replyToText, [], msgRowId);
     } catch (err) {
       log.error({ err }, "Error handling message");
       await ctx.reply("Internal error processing your message.");
@@ -184,8 +246,13 @@ export function initTelegramBot(): Bot {
   bot.on("message:photo", async (ctx) => {
     if (!messageHandler) return;
 
-    const caption = ctx.message.caption ?? "";
     const messageId = ctx.message.message_id;
+    if (isDuplicateMessage(messageId)) {
+      log.debug({ messageId }, "Duplicate photo message skipped");
+      return;
+    }
+
+    const caption = ctx.message.caption ?? "";
     const chatId = ctx.chat.id;
     const replyTo = ctx.message.reply_to_message?.message_id ?? null;
     const replyToText = ctx.message.reply_to_message?.text ?? ctx.message.reply_to_message?.caption ?? null;
@@ -230,8 +297,23 @@ export function initTelegramBot(): Bot {
 
     const text = caption || "[User sent a photo with no caption]";
 
+    let msgRowId = 0;
     try {
-      await messageHandler(text, messageId, chatId, replyTo, replyToText, [image]);
+      msgRowId = insertTelegramMessage({
+        telegramMessageId: messageId,
+        telegramChatId: chatId,
+        direction: "in",
+        source: "user_photo",
+        text,
+        imagePaths: [image.localPath],
+        replyToTelegramMessageId: replyTo,
+      }).id;
+    } catch (err) {
+      log.warn({ err }, "Failed to log incoming photo");
+    }
+
+    try {
+      await messageHandler(text, messageId, chatId, replyTo, replyToText, [image], msgRowId);
     } catch (err) {
       log.error({ err }, "Error handling photo message");
       await ctx.reply("Internal error processing your message.");
@@ -248,8 +330,21 @@ export function initTelegramBot(): Bot {
 
     log.debug({ text, messageId, chatId }, "Received edited message");
 
+    let msgRowId = 0;
     try {
-      await editHandler(text, messageId, chatId);
+      msgRowId = insertTelegramMessage({
+        telegramMessageId: messageId,
+        telegramChatId: chatId,
+        direction: "in",
+        source: "user_edit",
+        text,
+      }).id;
+    } catch (err) {
+      log.warn({ err }, "Failed to log incoming edit");
+    }
+
+    try {
+      await editHandler(text, messageId, chatId, msgRowId);
     } catch (err) {
       log.error({ err }, "Error handling edit");
     }
@@ -285,7 +380,19 @@ export function initTelegramBot(): Bot {
   // /status command
   bot.command("status", async (ctx) => {
     if (messageHandler) {
-      await messageHandler("status", ctx.message!.message_id, ctx.chat.id, null, null, []);
+      let msgRowId = 0;
+      try {
+        msgRowId = insertTelegramMessage({
+          telegramMessageId: ctx.message!.message_id,
+          telegramChatId: ctx.chat.id,
+          direction: "in",
+          source: "user_text",
+          text: "status",
+        }).id;
+      } catch (err) {
+        log.warn({ err }, "Failed to log /status command");
+      }
+      await messageHandler("status", ctx.message!.message_id, ctx.chat.id, null, null, [], msgRowId);
     }
   });
 
@@ -329,37 +436,56 @@ const TELEGRAM_MAX_LENGTH = 4096;
 export async function sendMessage(
   chatId: number,
   text: string,
-  options?: { plain?: boolean; html?: boolean },
+  options?: { plain?: boolean; html?: boolean; context?: SendContext },
 ): Promise<number> {
   if (!bot) throw new Error("Bot not initialized");
+
+  let telegramMsgId: number;
 
   if (options?.plain) {
     try {
       const msg = await bot.api.sendMessage(chatId, text);
-      return msg.message_id;
+      telegramMsgId = msg.message_id;
     } catch (err) {
       log.error({ err, chatId, text: text.slice(0, 100) }, "Failed to send plain message");
       throw err;
     }
-  }
+  } else {
+    // Convert markdown to HTML (or use as-is if already HTML)
+    const htmlText = options?.html ? text : markdownToTelegramHtml(text);
 
-  // Convert markdown to HTML (or use as-is if already HTML)
-  const htmlText = options?.html ? text : markdownToTelegramHtml(text);
-
-  // 2-step fallback: HTML → plain text
-  try {
-    const msg = await bot.api.sendMessage(chatId, htmlText, { parse_mode: "HTML" });
-    return msg.message_id;
-  } catch {
+    // 2-step fallback: HTML → plain text
     try {
-      const plainText = stripHtmlTags(htmlText);
-      const msg = await bot.api.sendMessage(chatId, plainText);
-      return msg.message_id;
-    } catch (err) {
-      log.error({ err, chatId, text: text.slice(0, 100) }, "Failed to send message (all parse modes failed)");
-      throw err;
+      const msg = await bot.api.sendMessage(chatId, htmlText, { parse_mode: "HTML" });
+      telegramMsgId = msg.message_id;
+    } catch {
+      try {
+        const plainText = stripHtmlTags(htmlText);
+        const msg = await bot.api.sendMessage(chatId, plainText);
+        telegramMsgId = msg.message_id;
+      } catch (err) {
+        log.error({ err, chatId, text: text.slice(0, 100) }, "Failed to send message (all parse modes failed)");
+        throw err;
+      }
     }
   }
+
+  // Log outgoing message
+  const ctx = options?.context;
+  try {
+    insertTelegramMessage({
+      telegramMessageId: telegramMsgId,
+      telegramChatId: chatId,
+      direction: "out",
+      source: ctx?.source ?? "system",
+      text,
+      workerId: ctx?.workerId,
+    });
+  } catch (err) {
+    log.warn({ err }, "Failed to log outgoing message");
+  }
+
+  return telegramMsgId;
 }
 
 /**
@@ -368,11 +494,11 @@ export async function sendMessage(
 export async function sendLongMessage(
   chatId: number,
   text: string,
-  options?: { plain?: boolean },
+  options?: { plain?: boolean; context?: SendContext },
 ): Promise<number[]> {
   if (options?.plain) {
     if (text.length <= TELEGRAM_MAX_LENGTH) {
-      return [await sendMessage(chatId, text, { plain: true })];
+      return [await sendMessage(chatId, text, { plain: true, context: options?.context })];
     }
     // Basic split for plain text
     const chunks: string[] = [];
@@ -388,7 +514,7 @@ export async function sendLongMessage(
 
     const msgIds: number[] = [];
     for (const chunk of chunks) {
-      msgIds.push(await sendMessage(chatId, chunk, { plain: true }));
+      msgIds.push(await sendMessage(chatId, chunk, { plain: true, context: options?.context }));
     }
     return msgIds;
   }
@@ -399,7 +525,7 @@ export async function sendLongMessage(
 
   const msgIds: number[] = [];
   for (const chunk of chunks) {
-    const msgId = await sendMessage(chatId, chunk.html, { html: true });
+    const msgId = await sendMessage(chatId, chunk.html, { html: true, context: options?.context });
     msgIds.push(msgId);
   }
   return msgIds;
@@ -408,40 +534,107 @@ export async function sendLongMessage(
 export async function sendQuestionMessage(
   chatId: number,
   workerId: number,
-  _questionId: number,
   question: string,
   emoji?: string,
+  mode?: string,
 ): Promise<number> {
   if (!bot) throw new Error("Bot not initialized");
 
   const escaped = escapeHtml(question);
   const emojiPrefix = emoji ? `${emoji} ` : '';
+  const modeTag = mode ? ` [${mode}]` : '';
   const text =
-    `${emojiPrefix}<b>Worker #${workerId} asks:</b>\n\n${escaped}\n\n` +
+    `${emojiPrefix}<b>#${workerId}${modeTag} asks:</b>\n\n${escaped}\n\n` +
     `<i>Reply to this message with your answer.</i>`;
 
+  let telegramMsgId: number;
   try {
     const msg = await bot.api.sendMessage(chatId, text, { parse_mode: "HTML" });
-    return msg.message_id;
+    telegramMsgId = msg.message_id;
   } catch {
     const plainEmoji = emoji ? `${emoji} ` : '';
-    const plain = `${plainEmoji}Worker #${workerId} asks:\n\n${question}\n\nReply to this message with your answer.`;
+    const plain = `${plainEmoji}#${workerId}${modeTag} asks:\n\n${question}\n\nReply to this message with your answer.`;
     const msg = await bot.api.sendMessage(chatId, plain);
-    return msg.message_id;
+    telegramMsgId = msg.message_id;
   }
+
+  try {
+    insertTelegramMessage({
+      telegramMessageId: telegramMsgId,
+      telegramChatId: chatId,
+      direction: "out",
+      source: "worker_question",
+      text: question,
+      workerId,
+    });
+  } catch (err) {
+    log.warn({ err }, "Failed to log outgoing question message");
+  }
+
+  return telegramMsgId;
 }
 
-export async function sendPhoto(chatId: number, photoPath: string, caption?: string): Promise<number> {
+export async function sendPhoto(chatId: number, photoPath: string, caption?: string, context?: SendContext): Promise<number> {
   if (!bot) throw new Error("Bot not initialized");
   try {
     const msg = await bot.api.sendPhoto(chatId, new InputFile(photoPath), {
       ...(caption ? { caption } : {}),
     });
+
+    try {
+      insertTelegramMessage({
+        telegramMessageId: msg.message_id,
+        telegramChatId: chatId,
+        direction: "out",
+        source: context?.source ?? "system",
+        text: caption ?? "[photo]",
+        imagePaths: [photoPath],
+        workerId: context?.workerId,
+      });
+    } catch (err) {
+      log.warn({ err }, "Failed to log outgoing photo message");
+    }
+
     return msg.message_id;
   } catch (err) {
     log.error({ err, chatId, photoPath }, "Failed to send photo");
     throw err;
   }
+}
+
+export async function sendDocument(chatId: number, filePath: string, caption?: string, context?: SendContext, retries = 1): Promise<number> {
+  if (!bot) throw new Error("Bot not initialized");
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const msg = await bot.api.sendDocument(chatId, new InputFile(filePath), {
+        ...(caption ? { caption } : {}),
+      });
+
+      try {
+        insertTelegramMessage({
+          telegramMessageId: msg.message_id,
+          telegramChatId: chatId,
+          direction: "out",
+          source: context?.source ?? "system",
+          text: caption ?? filePath,
+          workerId: context?.workerId,
+        });
+      } catch (err) {
+        log.warn({ err }, "Failed to log outgoing document message");
+      }
+
+      return msg.message_id;
+    } catch (err) {
+      if (attempt < retries) {
+        log.warn({ err, chatId, filePath, attempt }, "Retrying document send");
+        await new Promise((r) => setTimeout(r, 2000));
+        continue;
+      }
+      log.error({ err, chatId, filePath }, "Failed to send document after retries");
+      throw err;
+    }
+  }
+  throw new Error("Unreachable");
 }
 
 export async function sendTypingAction(chatId: number): Promise<void> {

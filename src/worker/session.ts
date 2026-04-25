@@ -11,28 +11,25 @@ import {
 import {
   updateWorkerState,
   updateWorkerSessionId,
-  updateWorkerHaikuSessionId,
   updateWorkerPermissionMode,
   touchWorkerActivity,
-  insertEvent,
-  insertPendingQuestion,
-  updateQuestionTelegramMessageId,
-  answerQuestion,
-  getWorkerById,
   getWorkerMessagesSince,
   getWorkerRecentMessages,
 } from "../db/queries.js";
+import { insertEvent, getEventsSinceLastTask } from "../db/message-log.js";
 import { WorkerState } from "../types/index.js";
 import type { AskUserQuestionItem } from "../types/index.js";
 import { createChildLogger } from "../utils/logger.js";
 import { buildCleanEnv } from "../utils/env.js";
+import type { SendContext } from "../telegram/index.js";
 
 const log = createChildLogger("worker");
 
 import { execSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { markdownToHtmlDocument } from "../markdown/index.js";
 import { homedir } from "node:os";
-import { basename, dirname, join, join as pathJoin } from "node:path";
+import { dirname, join, join as pathJoin } from "node:path";
 import { fileURLToPath } from "node:url";
 
 function findClaudeBinary(): string {
@@ -51,45 +48,49 @@ function findClaudeBinary(): string {
 const CLAUDE_BINARY = findClaudeBinary();
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const FORMATTER_DIR = join(__dirname, "..", "..", "concierg-workspace", "haiku-formatter");
+const PROJECT_ROOT = join(__dirname, "..", "..");
 
-/** Shared Haiku call for text formatting. No tools allowed — pure text in, text out. */
-async function haikuFormat(
-  content: string,
-  instruction: string,
-  fallback: string,
-  label: string,
-  resumeId?: string,
-): Promise<{ text: string; sessionId: string | null }> {
+const FORMATTER_EVENT_TYPES = new Set([
+  "worker_spawning", "follow_up",
+  "tool_use", "assistant_message",
+  "question_asked", "question_answered",
+  "plan_proposed", "plan_approved", "plan_rejected",
+]);
+
+type FormatterSkill = "format-plan" | "format-result" | "format-question";
+
+type PlanOutcome = { kind: "approve" } | { kind: "reject"; prompt: string };
+
+async function formatText(opts: {
+  skill: FormatterSkill;
+  input: Record<string, unknown>;
+  label: string;
+}): Promise<string> {
   const noTools: CanUseTool = async () => ({
     behavior: "deny" as const,
     message: "No tools. Output the formatted text directly as plain text.",
   });
 
-  const prompt = `RULES:\n${instruction}\n\nINPUT:\n${content}`;
+  const prompt = `/${opts.skill}\n\n${JSON.stringify(opts.input)}`;
 
   const conversation = query({
     prompt,
     options: {
-      model: "claude-haiku-4-5-20251001",
+      model: "claude-opus-4-7",
+      effort: "medium",
       systemPrompt: { type: "preset", preset: "claude_code" },
-      settingSources: [],
+      settingSources: ["user", "project"],
       maxTurns: 2,
-      cwd: FORMATTER_DIR,
+      cwd: PROJECT_ROOT,
       canUseTool: noTools,
       pathToClaudeCodeExecutable: CLAUDE_BINARY,
       env: buildCleanEnv(),
-      ...(resumeId ? { resume: resumeId } : {}),
     },
   });
 
   let result = "";
-  let sessionId: string | null = null;
   try {
     for await (const msg of conversation) {
-      if (msg.type === "system" && (msg as any).subtype === "init") {
-        sessionId = (msg as any).session_id ?? null;
-      }
       if (msg.type === "assistant" && msg.message?.content) {
         for (const block of msg.message.content) {
           if (block.type === "text") result += block.text;
@@ -98,23 +99,13 @@ async function haikuFormat(
     }
   } catch (err: any) {
     if (err?.message?.includes("exited with code 1")) {
-      log.warn(`Haiku exited with code 1 (${label}), using accumulated output`);
+      log.warn(`Formatter exited with code 1 (${opts.label}), using accumulated output`);
     } else {
-      log.warn({ err }, `Haiku error in ${label}`);
+      log.warn({ err }, `Formatter error in ${opts.label}`);
     }
   }
-  return { text: result.trim() || fallback, sessionId };
+  return result.trim();
 }
-
-const PLAN_INSTRUCTION = "Format this plan for Telegram.";
-const QUESTION_INSTRUCTION = "Format these questions for Telegram.";
-const RESULT_INSTRUCTION = "Summarise what was accomplished for Telegram.";
-const FOLLOWUP_ANSWER_INSTRUCTION =
-  "User asked a follow-up question during plan review. " +
-  "Worker explored the codebase and gathered information. " +
-  "Summarize what the worker found as a direct answer to the user's question. " +
-  "If PLAN_CHANGED=true, also include the updated plan. " +
-  "If PLAN_CHANGED=false, focus only on the answer — do NOT repeat the plan.";
 
 function simpleHash(str: string): string {
   let hash = 0;
@@ -124,58 +115,40 @@ function simpleHash(str: string): string {
   return hash.toString(36);
 }
 
-export type CompletionHandler = (
-  workerId: number,
-  result: SDKResultMessage
-) => void;
-
-/**
- * Parse AskUserQuestion structured input into readable text + structured items.
- * Handles both { questions: [...] } and legacy { question: string }.
- */
+/** Parse AskUserQuestion structured input into readable text + structured items. */
 function parseAskUserQuestion(input: unknown): { text: string; questions: AskUserQuestionItem[] } {
   const inp = input as Record<string, unknown>;
 
-  if (Array.isArray(inp.questions)) {
-    const questions: AskUserQuestionItem[] = (inp.questions as any[]).map((q) => ({
-      question: String(q.question || ""),
-      header: String(q.header || ""),
-      multiSelect: Boolean(q.multiSelect),
-      options: Array.isArray(q.options)
-        ? q.options.map((o: any) => ({
-            label: String(o.label || ""),
-            description: String(o.description || ""),
-          }))
-        : [],
-    }));
-
-    const textParts = questions.map((q) => {
-      let text = "";
-      if (q.header) text += `${q.header}: `;
-      text += q.question;
-      if (q.options.length > 0) {
-        text += "\n" + q.options
-          .map((o, j) => `  ${j + 1}. ${o.label}${o.description ? ` — ${o.description}` : ""}`)
-          .join("\n");
-      }
-      if (q.multiSelect) text += "\n  (multiple selections allowed)";
-      return text;
-    });
-
-    return { text: textParts.join("\n\n"), questions };
+  if (!Array.isArray(inp.questions)) {
+    return { text: JSON.stringify(input), questions: [] };
   }
 
-  if (typeof inp.question === "string") {
-    return { text: inp.question, questions: [] };
-  }
+  const questions: AskUserQuestionItem[] = (inp.questions as any[]).map((q) => ({
+    question: String(q.question || ""),
+    header: String(q.header || ""),
+    multiSelect: Boolean(q.multiSelect),
+    options: Array.isArray(q.options)
+      ? q.options.map((o: any) => ({
+          label: String(o.label || ""),
+          description: String(o.description || ""),
+        }))
+      : [],
+  }));
 
-  return { text: JSON.stringify(input), questions: [] };
-}
+  const textParts = questions.map((q) => {
+    let text = "";
+    if (q.header) text += `${q.header}: `;
+    text += q.question;
+    if (q.options.length > 0) {
+      text += "\n" + q.options
+        .map((o, j) => `  ${j + 1}. ${o.label}${o.description ? ` — ${o.description}` : ""}`)
+        .join("\n");
+    }
+    if (q.multiSelect) text += "\n  (multiple selections allowed)";
+    return text;
+  });
 
-interface WorkerEvent {
-  timestamp: Date;
-  type: 'stdout' | 'stderr' | 'tool' | 'state' | 'message' | 'error';
-  content: string;
+  return { text: textParts.join("\n\n"), questions };
 }
 
 /** Extract a short text preview from an SDK assistant message's content field. */
@@ -192,38 +165,24 @@ function extractContentPreview(content: unknown): string {
   return "(unknown content)";
 }
 
-function summarizeToolUse(toolName: string, input: unknown): string {
-  const inp = input as Record<string, unknown>;
-  switch (toolName) {
-    case 'Read':   return `Reading ${inp.file_path || 'file'}`;
-    case 'Write':  return `Writing ${inp.file_path || 'file'}`;
-    case 'Edit':   return `Editing ${inp.file_path || 'file'}`;
-    case 'Grep':   return `Searching for "${inp.pattern}" in ${inp.path || 'codebase'}`;
-    case 'Glob':   return `Finding files matching ${inp.pattern || '*'}`;
-    case 'Bash':   return `Running: ${String(inp.command || '').slice(0, 80)}`;
-    case 'Task':   return `Delegating subtask`;
-    default:       return `Using ${toolName}`;
-  }
-}
-
 /**
  * Context for direct Telegram communication from the worker.
  */
 export interface WorkerTelegramContext {
   chatId: number;
   emoji: string;
+  workerId: number;
   sendMessage: (chatId: number, text: string) => Promise<number>;
   /** Send a long markdown message, auto-chunked and formatted for Telegram HTML */
-  sendLongMessage: (chatId: number, text: string) => Promise<number[]>;
+  sendLongMessage: (chatId: number, text: string, contextOverride?: import("../telegram/index.js").SendContext) => Promise<number[]>;
   sendQuestionMessage: (
     chatId: number,
     workerId: number,
-    questionId: number,
     question: string,
     emoji?: string,
+    mode?: string,
   ) => Promise<number>;
-  /** Track which worker sent which Telegram message (for reply routing) */
-  trackMessage: (telegramMsgId: number, workerId: number) => void;
+  sendDocument: (chatId: number, filePath: string, caption?: string, contextOverride?: import("../telegram/index.js").SendContext) => Promise<number>;
 }
 
 export class WorkerLLM {
@@ -235,33 +194,24 @@ export class WorkerLLM {
   private query: Query | null = null;
   private abortController = new AbortController();
   private sessionId: string | null = null;
-  private haikuSessionId: string | null = null;
   private _state: WorkerState = WorkerState.Starting;
   private pendingFollowUp: string | null = null;
   private followUpSignal: { resolve: (msg: string) => void } | null = null;
-  private _totalCostUsd = 0;
   private planApproved = false;
-
-  private eventBuffer: WorkerEvent[] = [];
-  private readonly MAX_EVENTS = 100;
-  private lastStdout = "";
-  private lastStderr = "";
 
   /** Telegram context for direct communication */
   private telegramCtx: WorkerTelegramContext;
 
-  /** In-memory question resolvers (keyed by questionId) */
-  private questionResolvers = new Map<number, (answer: string) => void>();
+  /** In-memory question resolver (one at a time — worker is blocked) */
+  private questionResolver: ((answer: string) => void) | null = null;
 
   /** Plan review resolver (only one at a time) */
-  private planResolver: ((decision: string) => void) | null = null;
+  private planResolver: ((outcome: PlanOutcome) => void) | null = null;
 
   /** Follow-up question tracking for plan mode batching */
   private followUpQuestion: string | null = null;
   private followUpTimestamp: string | null = null;
   private lastPlanHash: string | null = null;
-
-  onCompletion: CompletionHandler | null = null;
 
   constructor(
     id: number,
@@ -275,6 +225,22 @@ export class WorkerLLM {
     this.prompt = prompt;
     this.telegramCtx = telegramCtx;
     this._permissionMode = permissionMode;
+  }
+
+  /** Short mode label for Telegram titles */
+  get modeTag(): string {
+    return this._permissionMode === 'plan' ? 'plan' : 'exec';
+  }
+
+  /** Insert an event linked to this worker's intent */
+  private logEvent(type: import("../types/index.js").EventType, data?: Record<string, unknown>, messageId?: number | null) {
+    touchWorkerActivity(this.id);
+    insertEvent({
+      workerId: this.id,
+      type,
+      data,
+      messageId: messageId ?? null,
+    });
   }
 
   get state(): WorkerState {
@@ -304,8 +270,7 @@ export class WorkerLLM {
     this.planApproved = false;
     updateWorkerPermissionMode(this.id, 'plan');
     log.info({ workerId: this.id }, "Switched to planning mode");
-    this.addEvent('state', 'Switched to planning mode');
-    insertEvent(this.id, "mode_switch", { mode: "plan" });
+    this.logEvent("mode_switch", { to: "plan" });
   }
 
   /**
@@ -317,88 +282,45 @@ export class WorkerLLM {
     this.planApproved = true;
     updateWorkerPermissionMode(this.id, 'default');
     log.info({ workerId: this.id }, "Switched to execution mode");
-    this.addEvent('state', 'Switched to execution mode');
-    insertEvent(this.id, "mode_switch", { mode: "default" });
+    this.logEvent("mode_switch", { to: "execution" });
   }
 
   private setState(state: WorkerState) {
     this._state = state;
     updateWorkerState(this.id, state);
-    insertEvent(this.id, "status_change", { state });
-    this.addEvent('state', `State changed to: ${state}`);
+    this.logEvent("status_change", { state });
   }
 
-  private addEvent(type: WorkerEvent['type'], content: string) {
-    const event: WorkerEvent = {
-      timestamp: new Date(),
-      type,
-      content: content.slice(0, 500) // Limit content size
-    };
-
-    this.eventBuffer.push(event);
-
-    // Keep only last MAX_EVENTS
-    if (this.eventBuffer.length > this.MAX_EVENTS) {
-      this.eventBuffer.shift();
-    }
-  }
-
-  getRecentEvents(count: number = 20): WorkerEvent[] {
-    return this.eventBuffer.slice(-count);
-  }
-
-  getLastOutput(): { stdout: string; stderr: string; events: WorkerEvent[] } {
-    return {
-      stdout: this.lastStdout,
-      stderr: this.lastStderr,
-      events: this.getRecentEvents()
-    };
-  }
-
-  get totalCostUsd(): number {
-    return this._totalCostUsd;
-  }
-
-  /** Build a synthetic error result for notifying of failures. */
-  private makeErrorResult(): SDKResultMessage {
-    return {
-      type: "result",
-      subtype: "error_during_execution",
-      total_cost_usd: 0,
-      num_turns: 0,
-      session_id: this.sessionId || "",
-    } as unknown as SDKResultMessage;
-  }
-
-  /** Resolve a pending question by its ID */
-  resolveQuestion(questionId: number, answer: string): boolean {
-    const resolver = this.questionResolvers.get(questionId);
-    if (resolver) {
-      // Update Haiku context with user's answer (silent, fire-and-forget)
-      this.addToHaikuContext(answer).catch(err => log.warn({ err, workerId: this.id }, "Haiku context update failed"));
-      answerQuestion(questionId, answer);
-      resolver(answer);
-      this.questionResolvers.delete(questionId);
-      log.info({ questionId, answer, workerId: this.id }, "Question resolved");
+  /** Resolve the pending question */
+  resolveQuestion(answer: string): boolean {
+    if (this.questionResolver) {
+      this.questionResolver(answer);
+      this.questionResolver = null;
+      log.info({ answer: answer.slice(0, 50), workerId: this.id }, "Question resolved");
       return true;
     }
     return false;
   }
 
-  /** Resolve a pending plan review */
-  resolvePlan(decision: string): boolean {
-    if (this.planResolver) {
-      this.planResolver(decision);
-      this.planResolver = null;
-      log.info({ workerId: this.id, decision: decision.slice(0, 50) }, "Plan resolved");
-      return true;
-    }
-    return false;
+  approvePlan(): boolean {
+    if (!this.planResolver) return false;
+    this.planResolver({ kind: "approve" });
+    this.planResolver = null;
+    log.info({ workerId: this.id }, "Plan approved");
+    return true;
+  }
+
+  rejectPlan(prompt: string): boolean {
+    if (!this.planResolver) return false;
+    this.planResolver({ kind: "reject", prompt });
+    this.planResolver = null;
+    log.info({ workerId: this.id }, "Plan rejected");
+    return true;
   }
 
   /** Check if this worker has a pending question with the given ID */
-  hasQuestion(questionId: number): boolean {
-    return this.questionResolvers.has(questionId);
+  hasQuestion(): boolean {
+    return this.questionResolver !== null;
   }
 
   /** Check if this worker has a pending plan review */
@@ -430,28 +352,20 @@ export class WorkerLLM {
 
         this.setState(WorkerState.WaitingInput);
 
-        // Insert question in DB (use raw parsed text as fallback)
-        const questionRow = insertPendingQuestion(this.id, parsed.text, "");
+        this.logEvent("question_asked", { question: parsed.text });
 
-        // Format question via Haiku for clean Telegram presentation
-        const formattedText = await this.callHaiku(JSON.stringify(input), QUESTION_INSTRUCTION, parsed.text, "question formatter");
+        const formattedText = await this.callFormatter({ skill: "format-question", input: { question: JSON.stringify(input) }, label: "question" });
 
-        // Send question directly to Telegram (plain text, no buttons)
-        const telegramMsgId = await this.telegramCtx.sendQuestionMessage(
+        await this.telegramCtx.sendQuestionMessage(
           this.telegramCtx.chatId,
           this.id,
-          questionRow.id,
           formattedText,
           this.telegramCtx.emoji,
+          this.modeTag,
         );
 
-        // Track message for reply routing
-        updateQuestionTelegramMessageId(questionRow.id, telegramMsgId);
-        this.telegramCtx.trackMessage(telegramMsgId, this.id);
-
-        // Wait for user to answer (via button tap or reply)
         const answer = await new Promise<string>((resolve) => {
-          this.questionResolvers.set(questionRow.id, resolve);
+          this.questionResolver = resolve;
         });
 
         this.setState(WorkerState.Active);
@@ -496,6 +410,16 @@ export class WorkerLLM {
             .filter(Boolean)
             .join("\n\n");
 
+          if (!workerText && !planChanged) {
+            log.warn({ workerId: this.id }, "Follow-up ExitPlanMode with no content — denying");
+            this.followUpQuestion = null;
+            this.followUpTimestamp = null;
+            return {
+              behavior: "deny" as const,
+              message: "Your response was too brief. Provide a substantive answer to the user's question before calling ExitPlanMode.",
+            };
+          }
+
           const bundle = [
             `USER QUESTION: ${this.followUpQuestion}`,
             `PLAN_CHANGED=${planChanged}`,
@@ -503,42 +427,55 @@ export class WorkerLLM {
             planChanged ? `UPDATED PLAN:\n${rawPlan}` : "",
           ].filter(Boolean).join("\n\n");
 
-          const formatted = await this.callHaiku(bundle, FOLLOWUP_ANSWER_INSTRUCTION, workerText || rawPlan, "follow-up answer");
-          const text = `${this.telegramCtx.emoji} #${this.id}:\n\n${formatted}`;
-          const msgIds = await this.telegramCtx.sendLongMessage(this.telegramCtx.chatId, text);
-          for (const mid of msgIds) {
-            this.telegramCtx.trackMessage(mid, this.id);
-          }
+          const formatted = await this.callFormatter({ skill: "format-result", input: { result: bundle }, label: "follow-up answer" });
+          this.logEvent("formatter_done", { context: "follow_up_answer" });
+          const text = `${this.telegramCtx.emoji} #${this.id} [${this.modeTag}]:\n\n${formatted}`;
+          const planCtx: SendContext = { source: "worker_plan", workerId: this.id };
+          await this.telegramCtx.sendLongMessage(this.telegramCtx.chatId, text, planCtx);
 
           this.followUpQuestion = null;
           this.followUpTimestamp = null;
         } else {
-          // First plan: format and send normally
-          const formattedPlan = await this.callHaiku(rawPlan, PLAN_INSTRUCTION, rawPlan, "plan formatter");
-          const planText = `${this.telegramCtx.emoji} Worker #${this.id} submitted a plan:\n\n${formattedPlan}\n\nReply "approve" to proceed or "reject" with feedback.`;
-          const msgIds = await this.telegramCtx.sendLongMessage(this.telegramCtx.chatId, planText);
-          for (const mid of msgIds) {
-            this.telegramCtx.trackMessage(mid, this.id);
+          // First plan: save as file + send formatted summary
+          this.logEvent("plan_proposed", { text: rawPlan });
+
+          // Save full plan as styled HTML file
+          const planDir = join(process.cwd(), "data", "plans");
+          mkdirSync(planDir, { recursive: true });
+          const planFile = join(planDir, `worker_${this.id}_plan_${Date.now()}.html`);
+          writeFileSync(planFile, markdownToHtmlDocument(rawPlan, { title: `Worker #${this.id} Plan` }));
+
+          // Send file first (non-blocking: text summary must always be delivered)
+          const planCtx: SendContext = { source: "worker_plan", workerId: this.id };
+          try {
+            await this.telegramCtx.sendDocument(
+              this.telegramCtx.chatId, planFile,
+              `${this.telegramCtx.emoji} #${this.id} [plan] — tap to read full plan`,
+              planCtx,
+            );
+          } catch (err) {
+            this.logEvent("plan_document_send_failed", { error: (err as Error).message, planFile });
           }
+
+          // Send formatted summary
+          const formattedPlan = await this.callFormatter({ skill: "format-plan", input: { plan: rawPlan }, label: "plan" });
+          this.logEvent("formatter_done", { context: "plan" });
+          const planText = `${this.telegramCtx.emoji} #${this.id} [plan]:\n\n${formattedPlan}\n\nReply "approve" to proceed or "reject" with feedback.`;
+          await this.telegramCtx.sendLongMessage(this.telegramCtx.chatId, planText, planCtx);
         }
 
         // Wait for user to approve/reject
-        const decision = await new Promise<string>((resolve) => {
+        const outcome = await new Promise<PlanOutcome>((resolve) => {
           this.planResolver = resolve;
         });
 
         this.setState(WorkerState.Active);
 
-        const trimmed = decision.trimStart();
-        if (trimmed.startsWith("APPROVED:")) {
-          this.switchToExecution(); // sets _permissionMode = 'default' + planApproved = true
+        if (outcome.kind === "approve") {
+          this.switchToExecution();
           return { behavior: "allow" as const, updatedInput: input };
-        } else {
-          const feedback = trimmed.startsWith("REJECTED:")
-            ? trimmed.slice("REJECTED:".length).trim()
-            : decision;
-          return { behavior: "deny" as const, message: feedback };
         }
+        return { behavior: "deny" as const, message: outcome.prompt };
       }
 
       // Allow worker's own MCP tools and standard tools
@@ -547,14 +484,10 @@ export class WorkerLLM {
 
     const postToolUseHook: HookCallback = async (hookInput) => {
       if (hookInput.hook_event_name === "PostToolUse") {
-        touchWorkerActivity(this.id);
-        insertEvent(this.id, "tool_use", {
-          tool: hookInput.tool_name,
-          input: hookInput.tool_input,
-        });
+        const toolData = { tool: hookInput.tool_name, input: hookInput.tool_input };
+        this.logEvent("tool_use", toolData);
 
         // Capture tool usage in event buffer
-        this.addEvent('tool', summarizeToolUse(hookInput.tool_name, hookInput.tool_input));
 
         // If it's a Bash tool, try to capture output
         if (hookInput.tool_name === 'Bash' && hookInput.tool_response) {
@@ -562,9 +495,6 @@ export class WorkerLLM {
             ? hookInput.tool_response
             : JSON.stringify(hookInput.tool_response);
 
-          // Store last stdout for status queries
-          this.lastStdout = output.slice(-2000); // Keep last 2000 chars
-          this.addEvent('stdout', output.slice(0, 500));
         }
       }
       return {};
@@ -585,7 +515,8 @@ export class WorkerLLM {
     // Outer loop: re-enters when a follow-up interrupts the current query
     while (true) {
       const options: Options = {
-        model: "claude-opus-4-6",
+        model: "claude-opus-4-7",
+        effort: "max",
         systemPrompt: { type: "preset", preset: "claude_code" },
         settingSources: ["user", "project"],
         cwd: this.projectPath,
@@ -608,8 +539,6 @@ export class WorkerLLM {
 
       try {
         for await (const message of this.query) {
-          touchWorkerActivity(this.id);
-
           if (message.type === "system" && message.subtype === "init") {
             this.sessionId = message.session_id;
             updateWorkerSessionId(this.id, message.session_id);
@@ -617,20 +546,19 @@ export class WorkerLLM {
               { workerId: this.id, sessionId: message.session_id },
               "Worker session started"
             );
-            this.addEvent('message', 'Session initialized');
+            this.logEvent("worker_started", { sessionId: message.session_id });
           }
 
           if (message.type === "assistant" && (message as any).message?.content) {
             const content = (message as any).message.content;
             const preview = extractContentPreview(content);
-            this.addEvent("message", `Assistant: ${preview}`);
 
             // Save full assistant text to DB for progress tracking and follow-up answers
             const fullText = Array.isArray(content)
               ? content.filter((b: any) => b.type === "text" && b.text).map((b: any) => b.text).join("\n")
               : typeof content === "string" ? content : "";
             if (fullText) {
-              insertEvent(this.id, "assistant_message", { text: fullText });
+              this.logEvent("assistant_message", { text: fullText });
             }
           }
 
@@ -647,14 +575,12 @@ export class WorkerLLM {
             }
 
             const result = message as SDKResultMessage;
-            this._totalCostUsd += result.total_cost_usd;
 
             // Completion — send result directly to Telegram
-            touchWorkerActivity(this.id);
             await this.handleCompletion(result);
 
             // Mark that result was delivered (prevents re-sending on restart)
-            insertEvent(this.id, "result_delivered", { subtype: result.subtype });
+            this.logEvent("result_delivered", { subtype: result.subtype });
 
             try {
               const nextMsg = await this.waitForFollowUp();
@@ -671,26 +597,20 @@ export class WorkerLLM {
       } catch (err: unknown) {
         if ((err as Error).name === "AbortError") {
           log.info({ workerId: this.id }, "Worker aborted");
-          this.addEvent('message', 'Worker aborted by user');
           return;
         }
         this.setState(WorkerState.Errored);
         log.error({ workerId: this.id, err }, "Worker error");
-        insertEvent(this.id, "error", {
-          message: (err as Error).message,
-        });
+        this.logEvent("worker_error", { message: (err as Error).message });
 
         const errorMsg = (err as Error).message || 'Unknown error';
-        this.lastStderr = errorMsg;
-        this.addEvent('error', errorMsg);
 
         // Send error to Telegram and notify completion handler
         try {
-          const text = `${this.telegramCtx.emoji} #${this.id} Error: ${errorMsg.slice(0, 500)}`;
+          const text = `${this.telegramCtx.emoji} #${this.id} [${this.modeTag}] Error: ${errorMsg.slice(0, 500)}`;
           await this.telegramCtx.sendMessage(this.telegramCtx.chatId, text);
         } catch { /* ignore send errors */ }
 
-        this.onCompletion?.(this.id, this.makeErrorResult());
 
         // Use pending follow-up if one was queued (e.g. switch_to_plan interrupted)
         if (this.pendingFollowUp) {
@@ -727,7 +647,6 @@ export class WorkerLLM {
       // No follow-up and no session — guard against silent exit
       if (!followUpToProcess) {
         this.setState(WorkerState.Errored);
-        this.onCompletion?.(this.id, this.makeErrorResult());
         return;
       }
     }
@@ -737,9 +656,13 @@ export class WorkerLLM {
   private async handleCompletion(result: SDKResultMessage): Promise<void> {
     const cost = result.total_cost_usd.toFixed(4);
 
+    this.logEvent("worker_completed", { subtype: result.subtype, cost: result.total_cost_usd, turns: result.num_turns });
+
     let resultText: string;
     if (result.subtype === "success" && result.result) {
-      resultText = await this.callHaiku(result.result, RESULT_INSTRUCTION, result.result, "result formatter");
+      this.logEvent("formatter_started", { context: "result" });
+      resultText = await this.callFormatter({ skill: "format-result", input: { result: result.result }, label: "result" });
+      this.logEvent("formatter_done", { context: "result" });
     } else if (result.subtype === "success") {
       // Empty SDK result — load recent assistant messages from DB (same pattern as plan follow-up)
       const messages = getWorkerRecentMessages(this.id, 3);
@@ -751,7 +674,9 @@ export class WorkerLLM {
         .filter(Boolean)
         .join("\n\n");
       if (fallback) {
-        resultText = await this.callHaiku(fallback, RESULT_INSTRUCTION, fallback, "result formatter");
+        this.logEvent("formatter_started", { context: "result_fallback" });
+        resultText = await this.callFormatter({ skill: "format-result", input: { result: fallback }, label: "result fallback" });
+        this.logEvent("formatter_done", { context: "result_fallback" });
       } else {
         resultText = "(no output)";
       }
@@ -759,71 +684,40 @@ export class WorkerLLM {
       resultText = `Error: ${result.subtype}`;
     }
 
-    const text = `${this.telegramCtx.emoji} #${this.id} done — $${cost}\n\n${resultText}`;
+    const text = `${this.telegramCtx.emoji} #${this.id} [${this.modeTag}] done — $${cost}\n\n${resultText}`;
 
     try {
-      const msgIds = await this.telegramCtx.sendLongMessage(this.telegramCtx.chatId, text);
-      for (const mid of msgIds) {
-        this.telegramCtx.trackMessage(mid, this.id);
-      }
+      const resultCtx: SendContext = { source: "worker_result", workerId: this.id };
+      await this.telegramCtx.sendLongMessage(this.telegramCtx.chatId, text, resultCtx);
     } catch (err) {
       log.error({ err, workerId: this.id }, "Failed to send completion to Telegram");
     }
 
-    insertEvent(this.id, "result", {
-      subtype: result.subtype,
-      cost: result.total_cost_usd,
-      turns: result.num_turns,
+  }
+
+  // --- Formatter ---
+
+  private async callFormatter(opts: {
+    skill: FormatterSkill;
+    input: Record<string, unknown>;
+    label: string;
+  }): Promise<string> {
+    const rawEvents = getEventsSinceLastTask(this.id);
+    const events = rawEvents
+      .filter(e => FORMATTER_EVENT_TYPES.has(e.type))
+      .map(e => ({
+        type: e.type,
+        data: e.data,
+        created_at: e.createdAt,
+      }));
+    return formatText({
+      skill: opts.skill,
+      input: { ...opts.input, events },
+      label: opts.label,
     });
-
-    this.onCompletion?.(this.id, result);
-  }
-
-  // --- Haiku session (per-worker persistent formatter) ---
-
-  /** Ensure the Haiku session exists: restore from DB or init fresh. */
-  private async ensureHaikuSession(): Promise<void> {
-    if (this.haikuSessionId) return;
-
-    const row = getWorkerById(this.id);
-    if (row?.haikuSessionId) {
-      this.haikuSessionId = row.haikuSessionId;
-      log.info({ workerId: this.id, haikuSessionId: row.haikuSessionId }, "Haiku session restored from DB");
-      return;
-    }
-
-    const projectName = basename(this.projectPath);
-    const initContext = `Worker #${this.id} ${this.telegramCtx.emoji} • ${projectName}\n${this.prompt}`;
-    const { sessionId } = await haikuFormat(initContext, 'Acknowledge with "Ready".', '', 'haiku-init');
-    if (sessionId) {
-      this.haikuSessionId = sessionId;
-      updateWorkerHaikuSessionId(this.id, sessionId);
-      log.info({ workerId: this.id, haikuSessionId: sessionId }, "Haiku session initialised");
-    }
-  }
-
-  /** Add a user/system message to Haiku context silently (no Telegram output). */
-  private async addToHaikuContext(message: string): Promise<void> {
-    await this.ensureHaikuSession();
-    await haikuFormat(message, 'Acknowledge with "ok".', '', 'haiku-context', this.haikuSessionId ?? undefined);
-  }
-
-  /** Format content via Haiku using the persistent session. */
-  private async callHaiku(content: string, instruction: string, fallback: string, label: string): Promise<string> {
-    await this.ensureHaikuSession();
-    const { text, sessionId } = await haikuFormat(
-      content, instruction, fallback, label, this.haikuSessionId ?? undefined,
-    );
-    if (sessionId && !this.haikuSessionId) {
-      this.haikuSessionId = sessionId;
-      updateWorkerHaikuSessionId(this.id, sessionId);
-    }
-    return text;
   }
 
   async followUp(message: string): Promise<void> {
-    // Update Haiku context with user message (silent, fire-and-forget)
-    this.addToHaikuContext(message).catch(err => log.warn({ err, workerId: this.id }, "Haiku context update failed"));
     if (this.followUpSignal) {
       // Worker is waiting for follow-up, wake it up
       this.followUpSignal.resolve(message);
@@ -831,13 +725,14 @@ export class WorkerLLM {
       return;
     }
     if (this.query) {
-      // Safety net: clear stale planResolver so the ExitPlanMode guard doesn't
-      // block the follow-up query from re-submitting a plan
+      // Defence in depth: the dispatcher routes follow_up-on-pending-plan to rejectPlan,
+      // so this branch shouldn't fire. If something ever reaches here with a pending plan,
+      // carry the message as rejection feedback instead of dropping it.
       if (this.planResolver) {
-        this.planResolver = null;
-        log.info({ workerId: this.id }, "Cleared stale plan resolver before follow-up interrupt");
+        this.rejectPlan(message);
+        log.info({ workerId: this.id }, "Follow-up arrived with pending plan — delivered message as rejection feedback");
+        return;
       }
-      // Worker is active, interrupt
       this.pendingFollowUp = message;
       await this.query.interrupt();
       return;
