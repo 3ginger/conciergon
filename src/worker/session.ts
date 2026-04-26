@@ -268,6 +268,9 @@ export class WorkerLLM {
   switchToPlanning(): void {
     this._permissionMode = 'plan';
     this.planApproved = false;
+    this.followUpQuestion = null;
+    this.followUpTimestamp = null;
+    this.lastPlanHash = null;
     updateWorkerPermissionMode(this.id, 'plan');
     log.info({ workerId: this.id }, "Switched to planning mode");
     this.logEvent("mode_switch", { to: "plan" });
@@ -280,6 +283,9 @@ export class WorkerLLM {
   switchToExecution(): void {
     this._permissionMode = 'default';
     this.planApproved = true;
+    this.followUpQuestion = null;
+    this.followUpTimestamp = null;
+    this.lastPlanHash = null;
     updateWorkerPermissionMode(this.id, 'default');
     log.info({ workerId: this.id }, "Switched to execution mode");
     this.logEvent("mode_switch", { to: "execution" });
